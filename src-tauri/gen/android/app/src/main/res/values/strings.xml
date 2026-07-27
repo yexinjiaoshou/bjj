@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">"Rollmap"</string>
+    <string name="exit_action">"Exit"</string>
+    <string name="exit_confirmation_message">"Are you sure you want to exit?"</string>
+    <string name="exit_confirmation_title">"Exit Rollmap?"</string>
+    <string name="main_activity_title">"Rollmap"</string>
+</resources>

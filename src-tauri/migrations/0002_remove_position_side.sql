@@ -1,0 +1,1 @@
+ALTER TABLE positions DROP COLUMN side;
