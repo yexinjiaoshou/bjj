@@ -76,6 +76,12 @@ interface StagedMediaFile {
   fileName: string | null;
 }
 
+interface SelectedMediaFile {
+  sourcePath: string;
+  extension: string;
+  fileName: string;
+}
+
 function supportedExtensions(kind: MediaKind) {
   return kind === "image" ? IMAGE_EXTENSIONS : VIDEO_EXTENSIONS;
 }
@@ -110,24 +116,11 @@ function validateMediaDirectory(mediaDirectory: string) {
   }
 }
 
-async function chooseMediaFile(kind: MediaKind) {
+async function inspectMediaFile(
+  kind: MediaKind,
+  sourcePath: string,
+): Promise<SelectedMediaFile> {
   const extensions = supportedExtensions(kind);
-  const sourcePath = await open({
-    title: kind === "image" ? "Choose an image" : "Choose a video",
-    multiple: false,
-    directory: false,
-    fileAccessMode: "copy",
-    filters: [
-      {
-        name: kind === "image" ? "Images" : "Videos",
-        extensions,
-      },
-    ],
-  });
-  if (!sourcePath) {
-    return null;
-  }
-
   const fileName = await basename(sourcePath);
   const extension = fileName.split(".").pop()?.toLowerCase() ?? "";
   if (!extensions.includes(extension)) {
@@ -141,6 +134,22 @@ async function chooseMediaFile(kind: MediaKind) {
     validateFileSize(kind, fileInfo.size);
   }
   return { sourcePath, extension, fileName };
+}
+
+async function chooseMediaFile(kind: MediaKind) {
+  const sourcePath = await open({
+    title: kind === "image" ? "Choose an image" : "Choose a video",
+    multiple: false,
+    directory: false,
+    fileAccessMode: "copy",
+    filters: [
+      {
+        name: kind === "image" ? "Images" : "Videos",
+        extensions: supportedExtensions(kind),
+      },
+    ],
+  });
+  return sourcePath ? inspectMediaFile(kind, sourcePath) : null;
 }
 
 async function copySelectedMediaFile(
@@ -279,6 +288,42 @@ export async function prepareVideoImport(
     return null;
   }
 
+  return stageVideoImport(
+    ownerType,
+    ownerId,
+    selectedFile,
+    mediaDirectory,
+    databaseUrl,
+  );
+}
+
+export async function prepareVideoImportFromPath(
+  ownerType: Attachment["ownerType"],
+  ownerId: string,
+  sourcePath: string,
+  mediaDirectory = MEDIA_DIRECTORY,
+  databaseUrl = "sqlite:rollmap.db",
+): Promise<VideoImportDraft> {
+  if (!isTauri()) {
+    throw new Error("Video import is available in the desktop app");
+  }
+  validateMediaDirectory(mediaDirectory);
+  return stageVideoImport(
+    ownerType,
+    ownerId,
+    await inspectMediaFile("video", sourcePath),
+    mediaDirectory,
+    databaseUrl,
+  );
+}
+
+async function stageVideoImport(
+  ownerType: Attachment["ownerType"],
+  ownerId: string,
+  selectedFile: SelectedMediaFile,
+  mediaDirectory: string,
+  databaseUrl: string,
+): Promise<VideoImportDraft> {
   const id = crypto.randomUUID();
   const stagingDirectory = `${mediaDirectory}/staging`;
   const sourceRelativePath = `${stagingDirectory}/${id}.${selectedFile.extension}`;

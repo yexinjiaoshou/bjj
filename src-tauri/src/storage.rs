@@ -56,9 +56,14 @@ const GRAPH_MIGRATIONS: &[GraphMigration] = &[
         description: "media_blobs",
         sql: include_str!("../migrations/0009_media_blobs.sql"),
     },
+    GraphMigration {
+        version: 10,
+        description: "sync_generations",
+        sql: include_str!("../migrations/0010_sync_generations.sql"),
+    },
 ];
 
-const LATEST_GRAPH_SCHEMA_VERSION: i64 = 9;
+const LATEST_GRAPH_SCHEMA_VERSION: i64 = 10;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -189,7 +194,38 @@ fn detect_schema_version(connection: &Connection) -> Result<i64, String> {
         if has_attachment_blob_hash != has_media_blobs {
             return Err("Knowledge database has an incomplete media blob schema".into());
         }
-        return Ok(if has_media_blobs { 9 } else { 8 });
+        if !has_media_blobs {
+            return Ok(8);
+        }
+        let generation_tables = [
+            "sync_entity_versions",
+            "sync_tombstones",
+            "sync_journal",
+            "sync_conflicts",
+        ];
+        let generation_column_count = generation_tables
+            .iter()
+            .map(|table| column_not_null(connection, table, "generation"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(Option::is_some)
+            .count();
+        let has_winning_generation =
+            column_not_null(connection, "sync_conflicts", "winning_generation")
+                .map_err(|error| error.to_string())?
+                .is_some();
+        if (generation_column_count != 0 && generation_column_count != generation_tables.len())
+            || (generation_column_count == 0 && has_winning_generation)
+            || (generation_column_count == generation_tables.len() && !has_winning_generation)
+        {
+            return Err("Knowledge database has an incomplete sync generation schema".into());
+        }
+        return Ok(if generation_column_count == generation_tables.len() {
+            10
+        } else {
+            9
+        });
     }
     if trigger_exists(connection, "positions_reject_pin_insert")
         .map_err(|error| error.to_string())?
@@ -386,13 +422,13 @@ mod tests {
         let directory = TestDirectory::new("new");
         let prepared =
             prepare_graph_database(&directory.0, "sqlite:library.db").expect("prepare database");
-        assert_eq!(prepared.schema_version, 9);
+        assert_eq!(prepared.schema_version, 10);
         assert!(prepared.backup_relative_path.is_none());
 
         let connection = Connection::open(directory.0.join("library.db")).expect("open database");
         assert_eq!(
             detect_schema_version(&connection).expect("detect schema"),
-            9
+            10
         );
         let migration_count: i64 = connection
             .query_row(
@@ -401,7 +437,18 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count migrations");
-        assert_eq!(migration_count, 9);
+        assert_eq!(migration_count, 10);
+        for table in [
+            "sync_entity_versions",
+            "sync_tombstones",
+            "sync_journal",
+            "sync_conflicts",
+        ] {
+            assert_eq!(
+                column_not_null(&connection, table, "generation").expect("read generation column"),
+                Some(true)
+            );
+        }
     }
 
     #[test]
@@ -422,7 +469,7 @@ mod tests {
 
         let prepared =
             prepare_graph_database(&directory.0, "sqlite:legacy.db").expect("upgrade database");
-        assert_eq!(prepared.schema_version, 9);
+        assert_eq!(prepared.schema_version, 10);
         let backup_relative_path = prepared.backup_relative_path.expect("backup path");
         let backup_path = directory.0.join(backup_relative_path);
         assert!(backup_path.is_file());
@@ -460,7 +507,7 @@ mod tests {
 
         let prepared =
             prepare_graph_database(&directory.0, "sqlite:existing.db").expect("baseline database");
-        assert_eq!(prepared.schema_version, 9);
+        assert_eq!(prepared.schema_version, 10);
         assert!(prepared.backup_relative_path.is_none());
     }
 
@@ -499,7 +546,7 @@ mod tests {
 
         let prepared = prepare_graph_database(&directory.0, "sqlite:sync-v5.db")
             .expect("upgrade sync database");
-        assert_eq!(prepared.schema_version, 9);
+        assert_eq!(prepared.schema_version, 10);
         assert!(prepared.backup_relative_path.is_some());
 
         let upgraded = Connection::open(database_path).expect("open upgraded database");

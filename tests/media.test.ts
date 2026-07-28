@@ -45,6 +45,7 @@ import {
   openAttachment,
   pickMediaAttachment,
   prepareVideoImport,
+  prepareVideoImportFromPath,
   resolveMediaUrl,
 } from "../src/services/media";
 import type { Attachment } from "../src/domain/types";
@@ -228,6 +229,42 @@ describe("imported media", () => {
     expect(native.copyFile).toHaveBeenCalledWith(
       "/tmp/Roll.mov",
       draft?.sourceRelativePath,
+      { toPathBaseDir: "AppData" },
+    );
+  });
+
+  it("stages a dropped macOS video path without opening the file picker", async () => {
+    native.isTauri = true;
+    native.basename.mockResolvedValue("Mounted roll.MOV");
+    native.stat.mockResolvedValue({ isFile: true, size: 8192 });
+    native.appDataDir.mockResolvedValue("/app-data");
+    native.join.mockResolvedValue(
+      "/app-data/media/staging/550e8400-e29b-41d4-a716-446655440000.mov",
+    );
+    native.convertFileSrc.mockReturnValue("asset://dropped-video-preview");
+    vi.spyOn(crypto, "randomUUID").mockReturnValue(image.id);
+
+    const draft = await prepareVideoImportFromPath(
+      "technique",
+      "technique-1",
+      "/Users/coach/Desktop/Mounted roll.MOV",
+    );
+
+    expect(draft).toMatchObject({
+      id: image.id,
+      ownerType: "technique",
+      ownerId: "technique-1",
+      title: "Mounted roll",
+      sourceRelativePath: `media/staging/${image.id}.mov`,
+      previewUrl: "asset://dropped-video-preview",
+    });
+    expect(native.open).not.toHaveBeenCalled();
+    expect(native.stat).toHaveBeenCalledWith(
+      "/Users/coach/Desktop/Mounted roll.MOV",
+    );
+    expect(native.copyFile).toHaveBeenCalledWith(
+      "/Users/coach/Desktop/Mounted roll.MOV",
+      `media/staging/${image.id}.mov`,
       { toPathBaseDir: "AppData" },
     );
   });

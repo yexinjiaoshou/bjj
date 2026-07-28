@@ -15,9 +15,13 @@ them. Each item can store notes, links, images, and videos.
 - Foreground DNS-SD discovery and automatic synchronization with trusted devices
 - Content-addressed image and video storage with resumable, verified downloads
 - Search, category and role filters, and automatic ELK graph layout
+- Per-database Undo and Redo on macOS and Android, including Command/Ctrl+Z,
+  Command/Ctrl+Shift+Z, and Ctrl+Y keyboard shortcuts
 - A virtual Unknown destination for transitions whose next position is not yet
 	known; edit the transition later to point it at a real position
 - Full-video or preview-selected clip imports
+- macOS video drag and drop for the selected position or transition, reusing
+	the quality and clip-range import controls for MP4, MOV, and M4V files
 - Compact 540p video storage by default, with 720p, 1080p, and original-quality
 	options
 - Bilibili share-link recognition with automatic titles, multi-part selection,
@@ -38,7 +42,7 @@ start point and reload the preview only after a selection is committed.
 Native builds keep stable library and device identities in
 `rollmap-catalog.db`. Every knowledge database uses the same native migration
 list, creates a consistent SQLite backup before an upgrade, and currently
-targets graph schema v9. Catalog schema v5 stores trusted peer identities,
+targets graph schema v10. Catalog schema v5 stores trusted peer identities,
 per-library authorizations, one-time pairing sessions, remembered LAN endpoints,
 and hybrid-logical-clock revisions and tombstones for each library.
 
@@ -55,9 +59,15 @@ resume from the snapshot's journal cursor. Journal compaction waits for every
 trusted peer authorized for that library to acknowledge the retained range;
 current winners, tombstones, and conflict audit records are not pruned.
 
+Undo and Redo keep up to 100 in-memory graph revisions per database for the
+current app session. Restoring a revision is an atomic graph mutation, and its
+result synchronizes like any other edit. Entity generations let an explicit
+restore supersede an older tombstone without allowing stale updates to revive
+deleted data.
+
 Native builds expose manual LAN pairing and synchronization from the toolbar.
 One device starts a server and creates a pasteable pairing payload; the other
-device selects the offered databases and joins. After pairing, protocol v2
+device selects the offered databases and joins. After pairing, protocol v3
 synchronizes the catalog by stable library UUID. New libraries create replicas
 with device-local database and media paths; renames and deletion tombstones
 converge without synchronizing local paths. Each library sync is isolated, so a

@@ -2,17 +2,29 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const native = vi.hoisted(() => ({ inspectBilibiliLink: vi.fn() }));
+const native = vi.hoisted(() => ({
+  inspectBilibiliLink: vi.fn(),
+  readClipboardText: vi.fn(),
+}));
 
 vi.mock("../src/services/bilibili", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../src/services/bilibili")>()),
   inspectBilibiliLink: native.inspectBilibiliLink,
 }));
+vi.mock("../src/services/clipboard", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/services/clipboard")>()),
+  readClipboardText: native.readClipboardText,
+}));
 
 import { AttachmentPanel } from "../src/features/editor/AttachmentPanel";
 
 beforeEach(() => {
+  vi.restoreAllMocks();
   vi.clearAllMocks();
+  vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+  native.readClipboardText.mockReset();
+  native.readClipboardText.mockResolvedValue(null);
   delete window.__ROLLMAP_CLOSE_ACTIVE_OVERLAY__;
 });
 
@@ -34,6 +46,63 @@ function renderPanel(overrides: Partial<Parameters<typeof AttachmentPanel>[0]> =
 }
 
 describe("attachment links", () => {
+  it("prefills the URL and uses remaining clipboard text as the title", async () => {
+    const user = userEvent.setup();
+    native.readClipboardText.mockResolvedValue(
+      "Guard passing details\nhttps://example.com/passing?chapter=2\nCoach Lee",
+    );
+    renderPanel();
+
+    await user.click(screen.getByRole("button", { name: "Add link" }));
+
+    await waitFor(() =>
+      expect(screen.getByLabelText("URL")).toHaveValue(
+        "https://example.com/passing?chapter=2",
+      ),
+    );
+    expect(screen.getByLabelText("Title")).toHaveValue(
+      "Guard passing details Coach Lee",
+    );
+  });
+
+  it("leaves the title empty when the clipboard contains only a URL", async () => {
+    const user = userEvent.setup();
+    native.readClipboardText.mockResolvedValue("https://example.com/guard-retention");
+    renderPanel();
+
+    await user.click(screen.getByRole("button", { name: "Add link" }));
+
+    await waitFor(() =>
+      expect(screen.getByLabelText("URL")).toHaveValue(
+        "https://example.com/guard-retention",
+      ),
+    );
+    expect(screen.getByLabelText("Title")).toHaveValue("");
+  });
+
+  it("does not overwrite link fields edited before clipboard reading finishes", async () => {
+    const user = userEvent.setup();
+    let resolveClipboard: (value: string) => void = () => {};
+    native.readClipboardText.mockReturnValue(
+      new Promise<string>((resolve) => {
+        resolveClipboard = resolve;
+      }),
+    );
+    renderPanel();
+
+    await user.click(screen.getByRole("button", { name: "Add link" }));
+    await user.type(screen.getByLabelText("Title"), "My reference");
+    await user.type(screen.getByLabelText("URL"), "https://manual.example.com");
+    resolveClipboard("Clipboard title https://clipboard.example.com");
+
+    await waitFor(() =>
+      expect(screen.getByLabelText("URL")).toHaveValue(
+        "https://manual.example.com",
+      ),
+    );
+    expect(screen.getByLabelText("Title")).toHaveValue("My reference");
+  });
+
   it("recognizes pasted Bilibili share text and saves an exact-time page link", async () => {
     const user = userEvent.setup();
     native.inspectBilibiliLink.mockResolvedValue({
@@ -135,6 +204,29 @@ describe("attachment links", () => {
     );
   });
 
+  it("allows saving while Bilibili metadata is still loading", async () => {
+    const user = userEvent.setup();
+    native.inspectBilibiliLink.mockReturnValue(new Promise(() => {}));
+    const props = renderPanel();
+
+    await user.click(screen.getByRole("button", { name: "Add link" }));
+    fireEvent.paste(screen.getByLabelText("URL"), {
+      clipboardData: { getData: () => "https://b23.tv/AbCd12" },
+    });
+    await user.type(screen.getByLabelText("Title"), "Passing reference");
+
+    const addSource = screen.getByRole("button", { name: "Add source" });
+    expect(addSource).toBeEnabled();
+    await user.click(addSource);
+
+    expect(props.onSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Passing reference",
+        value: "https://b23.tv/AbCd12",
+      }),
+    );
+  });
+
   it("shows saved Bilibili page and timestamp details", () => {
     renderPanel({
       attachments: [
@@ -191,6 +283,94 @@ describe("attachment media", () => {
     );
     expect(window.__ROLLMAP_CLOSE_ACTIVE_OVERLAY__?.()).toBe(true);
     await waitFor(() => expect(viewer).not.toBeInTheDocument());
+  });
+
+  it("hands video playback off to fullscreen and back without duplicate audio", async () => {
+    const user = userEvent.setup();
+    const play = vi.mocked(HTMLMediaElement.prototype.play);
+    const pause = vi.mocked(HTMLMediaElement.prototype.pause);
+    const attachment = {
+      id: "550e8400-e29b-41d4-a716-446655440000",
+      ownerType: "technique" as const,
+      ownerId: "technique-1",
+      kind: "video" as const,
+      title: "Guard retention video",
+      value: "media/550e8400-e29b-41d4-a716-446655440000.mp4",
+      mimeType: "video/mp4",
+      fileExtension: "mp4",
+    };
+    renderPanel({ attachments: [attachment] });
+    const fullscreenButton = await screen.findByRole("button", {
+      name: `View ${attachment.title} fullscreen`,
+    });
+    const inlineVideo = fullscreenButton
+      .closest(".attachment-media-preview")
+      ?.querySelector("video") as HTMLVideoElement;
+    inlineVideo.currentTime = 42;
+    Object.defineProperty(inlineVideo, "paused", {
+      configurable: true,
+      value: false,
+    });
+
+    await user.click(fullscreenButton);
+
+    expect(pause.mock.contexts).toContain(inlineVideo);
+    const viewer = screen.getByRole("dialog", {
+      name: `Fullscreen preview: ${attachment.title}`,
+    });
+    const fullscreenVideo = viewer.querySelector("video") as HTMLVideoElement;
+    fireEvent.loadedMetadata(fullscreenVideo);
+    expect(fullscreenVideo.currentTime).toBe(42);
+    expect(play.mock.contexts).toContain(fullscreenVideo);
+
+    fullscreenVideo.currentTime = 73;
+    Object.defineProperty(fullscreenVideo, "paused", {
+      configurable: true,
+      value: false,
+    });
+    await user.click(
+      screen.getByRole("button", { name: "Close fullscreen preview" }),
+    );
+
+    expect(pause.mock.contexts).toContain(fullscreenVideo);
+    expect(inlineVideo.currentTime).toBe(73);
+    expect(play.mock.contexts).toContain(inlineVideo);
+  });
+
+  it("pauses video when the attachment panel becomes inactive", async () => {
+    const pause = vi.mocked(HTMLMediaElement.prototype.pause);
+    const attachment = {
+      id: "550e8400-e29b-41d4-a716-446655440000",
+      ownerType: "technique" as const,
+      ownerId: "technique-1",
+      kind: "video" as const,
+      title: "Guard retention video",
+      value: "media/550e8400-e29b-41d4-a716-446655440000.mp4",
+      mimeType: "video/mp4",
+      fileExtension: "mp4",
+    };
+    const props = {
+      ownerType: "technique" as const,
+      ownerId: "technique-1",
+      attachments: [attachment],
+      isBusy: false,
+      onSave: vi.fn(),
+      onAddMedia: vi.fn(),
+      onDelete: vi.fn(),
+      onDownload: vi.fn(),
+      onOpen: vi.fn(),
+    };
+    const { rerender } = render(<AttachmentPanel {...props} isActive />);
+    const fullscreenButton = await screen.findByRole("button", {
+      name: `View ${attachment.title} fullscreen`,
+    });
+    const inlineVideo = fullscreenButton
+      .closest(".attachment-media-preview")
+      ?.querySelector("video") as HTMLVideoElement;
+
+    rerender(<AttachmentPanel {...props} isActive={false} />);
+
+    await waitFor(() => expect(pause.mock.contexts).toContain(inlineVideo));
   });
 
   it("offers an on-demand download for a missing content object", async () => {

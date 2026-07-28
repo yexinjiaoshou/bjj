@@ -176,9 +176,18 @@ interface TechniqueEditorDialogProps {
   positions: Position[];
   isNew: boolean;
   isSaving?: boolean;
-  onSave: (technique: Technique) => void;
+  onSave: (request: TechniqueSaveRequest) => void;
   onClose: () => void;
 }
+
+export type TechniqueTargetMode = "create" | "existing" | "unknown";
+
+export interface TechniqueSaveRequest {
+  technique: Technique;
+  targetMode: TechniqueTargetMode;
+}
+
+const CREATE_TARGET_VALUE = "__create-position__";
 
 export function TechniqueEditorDialog({
   technique,
@@ -190,6 +199,13 @@ export function TechniqueEditorDialog({
 }: TechniqueEditorDialogProps) {
   const [draft, setDraft] = useState(technique);
   const [tags, setTags] = useState(technique.tags.join(", "));
+  const [targetMode, setTargetMode] = useState<TechniqueTargetMode>(() =>
+    technique.targetPositionId !== null
+      ? "existing"
+      : isNew
+        ? "create"
+        : "unknown",
+  );
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -201,7 +217,10 @@ export function TechniqueEditorDialog({
     ) {
       return;
     }
-    onSave({ ...draft, name, tags: splitList(tags) });
+    onSave({
+      technique: { ...draft, name, tags: splitList(tags) },
+      targetMode,
+    });
   }
 
   return (
@@ -239,20 +258,34 @@ export function TechniqueEditorDialog({
         <label className="field">
           <span>To</span>
           <select
-            value={draft.targetPositionId ?? ""}
-            onChange={(event) =>
-              setDraft({
-                ...draft,
-                targetPositionId: event.target.value || null,
-              })
+            value={
+              targetMode === "create"
+                ? CREATE_TARGET_VALUE
+                : (draft.targetPositionId ?? "")
             }
+            onChange={(event) => {
+              const targetValue = event.target.value;
+              if (targetValue === CREATE_TARGET_VALUE) {
+                setTargetMode("create");
+                setDraft({ ...draft, targetPositionId: null });
+              } else if (targetValue) {
+                setTargetMode("existing");
+                setDraft({ ...draft, targetPositionId: targetValue });
+              } else {
+                setTargetMode("unknown");
+                setDraft({ ...draft, targetPositionId: null });
+              }
+            }}
           >
-            <option value="">Unknown (set later)</option>
+            {isNew && (
+              <option value={CREATE_TARGET_VALUE}>Create new position</option>
+            )}
             {positions.map((position) => (
               <option key={position.id} value={position.id}>
                 {position.name}
               </option>
             ))}
+            <option value="">Unknown (set later)</option>
           </select>
         </label>
         <fieldset className="field field--wide">

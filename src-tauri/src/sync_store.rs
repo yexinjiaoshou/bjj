@@ -1,14 +1,14 @@
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const BASELINE_COMPLETE_KEY: &str = "baseline_complete";
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Position {
     id: String,
@@ -22,7 +22,7 @@ pub struct Position {
     y: f64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Technique {
     id: String,
@@ -35,7 +35,7 @@ pub struct Technique {
     tags: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attachment {
     pub(crate) id: String,
@@ -54,7 +54,7 @@ pub struct Attachment {
     pub(crate) byte_size: Option<i64>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PositionCoordinates {
     id: String,
@@ -131,6 +131,8 @@ pub enum GraphMutation {
         #[serde(rename = "attachmentId")]
         attachment_id: String,
     },
+    #[serde(rename = "restoreHistorySnapshot")]
+    RestoreHistorySnapshot { graph: KnowledgeGraph },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -202,6 +204,7 @@ pub struct SyncChange {
     pub entity_type: SyncEntityType,
     pub entity_id: String,
     pub operation: SyncOperation,
+    pub generation: i64,
     pub hlc: HybridTimestamp,
     pub origin_device_id: String,
     pub payload: Option<Value>,
@@ -359,31 +362,56 @@ fn record_upsert(
     payload_json: &str,
     device_id: &str,
 ) -> Result<(), String> {
-    let was_deleted: bool = transaction
+    record_upsert_with_mode(
+        transaction,
+        entity_type,
+        entity_id,
+        payload_json,
+        device_id,
+        false,
+    )
+}
+
+fn record_upsert_with_mode(
+    transaction: &Transaction<'_>,
+    entity_type: &str,
+    entity_id: &str,
+    payload_json: &str,
+    device_id: &str,
+    allow_restore: bool,
+) -> Result<(), String> {
+    let current = transaction
         .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sync_tombstones
-                WHERE entity_type = ?1 AND entity_id = ?2
-             )",
+            "SELECT generation, is_deleted FROM sync_entity_versions
+             WHERE entity_type = ?1 AND entity_id = ?2",
             params![entity_type, entity_id],
-            |row| row.get(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
         )
+        .optional()
         .map_err(|error| error.to_string())?;
-    if was_deleted {
+    if current.is_some_and(|(_, is_deleted)| is_deleted) && !allow_restore {
         return Err("A deleted sync entity identity cannot be reused".into());
     }
+    let generation = match current {
+        Some((generation, true)) => generation
+            .checked_add(1)
+            .ok_or_else(|| "Sync entity generation overflowed".to_string())?,
+        Some((generation, false)) => generation,
+        None => 0,
+    };
     let timestamp = next_timestamp(transaction)?;
     let change_id = Uuid::new_v4().to_string();
     transaction
         .execute(
             "INSERT INTO sync_journal (
-                change_id, entity_type, entity_id, operation, hlc_physical_ms,
-                hlc_logical_counter, origin_device_id, payload_json
-             ) VALUES (?1, ?2, ?3, 'upsert', ?4, ?5, ?6, ?7)",
+                change_id, entity_type, entity_id, operation, generation,
+                hlc_physical_ms, hlc_logical_counter, origin_device_id, payload_json
+             ) VALUES (?1, ?2, ?3, 'upsert', ?4, ?5, ?6, ?7, ?8)",
             params![
                 change_id,
                 entity_type,
                 entity_id,
+                generation,
                 timestamp.physical_ms,
                 timestamp.logical_counter,
                 device_id,
@@ -394,10 +422,12 @@ fn record_upsert(
     transaction
         .execute(
             "INSERT INTO sync_entity_versions (
-                entity_type, entity_id, hlc_physical_ms, hlc_logical_counter,
-                     origin_device_id, is_deleted, payload_json, winning_change_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
+                entity_type, entity_id, generation, hlc_physical_ms,
+                hlc_logical_counter, origin_device_id, is_deleted, payload_json,
+                winning_change_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)
              ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                generation = excluded.generation,
                 hlc_physical_ms = excluded.hlc_physical_ms,
                 hlc_logical_counter = excluded.hlc_logical_counter,
                 origin_device_id = excluded.origin_device_id,
@@ -407,6 +437,7 @@ fn record_upsert(
             params![
                 entity_type,
                 entity_id,
+                generation,
                 timestamp.physical_ms,
                 timestamp.logical_counter,
                 device_id,
@@ -430,18 +461,29 @@ fn record_delete(
     entity_id: &str,
     device_id: &str,
 ) -> Result<(), String> {
+    let generation = transaction
+        .query_row(
+            "SELECT generation FROM sync_entity_versions
+             WHERE entity_type = ?1 AND entity_id = ?2",
+            params![entity_type, entity_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(0);
     let timestamp = next_timestamp(transaction)?;
     let change_id = Uuid::new_v4().to_string();
     transaction
         .execute(
             "INSERT INTO sync_journal (
-                change_id, entity_type, entity_id, operation, hlc_physical_ms,
-                hlc_logical_counter, origin_device_id, payload_json
-             ) VALUES (?1, ?2, ?3, 'delete', ?4, ?5, ?6, NULL)",
+                     change_id, entity_type, entity_id, operation, generation,
+                     hlc_physical_ms, hlc_logical_counter, origin_device_id, payload_json
+                 ) VALUES (?1, ?2, ?3, 'delete', ?4, ?5, ?6, ?7, NULL)",
             params![
                 change_id,
                 entity_type,
                 entity_id,
+                generation,
                 timestamp.physical_ms,
                 timestamp.logical_counter,
                 device_id,
@@ -451,10 +493,12 @@ fn record_delete(
     transaction
         .execute(
             "INSERT INTO sync_entity_versions (
-                entity_type, entity_id, hlc_physical_ms, hlc_logical_counter,
-                origin_device_id, is_deleted, payload_json, winning_change_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, ?6)
+                     entity_type, entity_id, generation, hlc_physical_ms,
+                     hlc_logical_counter, origin_device_id, is_deleted, payload_json,
+                     winning_change_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, NULL, ?7)
              ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                     generation = excluded.generation,
                 hlc_physical_ms = excluded.hlc_physical_ms,
                 hlc_logical_counter = excluded.hlc_logical_counter,
                 origin_device_id = excluded.origin_device_id,
@@ -464,6 +508,7 @@ fn record_delete(
             params![
                 entity_type,
                 entity_id,
+                generation,
                 timestamp.physical_ms,
                 timestamp.logical_counter,
                 device_id,
@@ -474,10 +519,11 @@ fn record_delete(
     transaction
         .execute(
             "INSERT INTO sync_tombstones (
-                entity_type, entity_id, hlc_physical_ms, hlc_logical_counter,
-                origin_device_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5)
+                     entity_type, entity_id, generation, hlc_physical_ms,
+                     hlc_logical_counter, origin_device_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                     generation = excluded.generation,
                 hlc_physical_ms = excluded.hlc_physical_ms,
                 hlc_logical_counter = excluded.hlc_logical_counter,
                 origin_device_id = excluded.origin_device_id,
@@ -485,6 +531,7 @@ fn record_delete(
             params![
                 entity_type,
                 entity_id,
+                generation,
                 timestamp.physical_ms,
                 timestamp.logical_counter,
                 device_id,
@@ -539,6 +586,44 @@ fn upsert_position(
     position: &Position,
     device_id: &str,
 ) -> Result<(), String> {
+    upsert_position_with_mode(transaction, position, device_id, false)
+}
+
+fn restore_history_position(
+    transaction: &Transaction<'_>,
+    current: Option<&Position>,
+    position: &Position,
+    device_id: &str,
+) -> Result<(), String> {
+    write_position(transaction, position)?;
+    let content_changed = match current {
+        Some(current) => position_entity_payload(current)? != position_entity_payload(position)?,
+        None => true,
+    };
+    if content_changed {
+        record_upsert_with_mode(
+            transaction,
+            "position",
+            &position.id,
+            &position_entity_payload(position)?,
+            device_id,
+            true,
+        )?;
+    }
+    if current.is_none_or(|current| current.x != position.x || current.y != position.y) {
+        record_upsert_with_mode(
+            transaction,
+            "position_layout",
+            &position.id,
+            &position_layout_payload(&position.id, position.x, position.y)?,
+            device_id,
+            true,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_position(transaction: &Transaction<'_>, position: &Position) -> Result<(), String> {
     validate_coordinates(position.x, position.y)?;
     let aliases_json =
         serde_json::to_string(&position.aliases).map_err(|error| error.to_string())?;
@@ -571,19 +656,31 @@ fn upsert_position(
             ],
         )
         .map_err(|error| error.to_string())?;
-    record_upsert(
+    Ok(())
+}
+
+fn upsert_position_with_mode(
+    transaction: &Transaction<'_>,
+    position: &Position,
+    device_id: &str,
+    allow_restore: bool,
+) -> Result<(), String> {
+    write_position(transaction, position)?;
+    record_upsert_with_mode(
         transaction,
         "position",
         &position.id,
         &position_entity_payload(position)?,
         device_id,
+        allow_restore,
     )?;
-    record_upsert(
+    record_upsert_with_mode(
         transaction,
         "position_layout",
         &position.id,
         &position_layout_payload(&position.id, position.x, position.y)?,
         device_id,
+        allow_restore,
     )
 }
 
@@ -617,6 +714,23 @@ fn upsert_technique(
     technique: &Technique,
     device_id: &str,
 ) -> Result<(), String> {
+    upsert_technique_with_mode(transaction, technique, device_id, false)
+}
+
+fn restore_history_technique(
+    transaction: &Transaction<'_>,
+    technique: &Technique,
+    device_id: &str,
+) -> Result<(), String> {
+    upsert_technique_with_mode(transaction, technique, device_id, true)
+}
+
+fn upsert_technique_with_mode(
+    transaction: &Transaction<'_>,
+    technique: &Technique,
+    device_id: &str,
+    allow_restore: bool,
+) -> Result<(), String> {
     let tags_json = serde_json::to_string(&technique.tags).map_err(|error| error.to_string())?;
     transaction
         .execute(
@@ -645,12 +759,13 @@ fn upsert_technique(
             ],
         )
         .map_err(|error| error.to_string())?;
-    record_upsert(
+    record_upsert_with_mode(
         transaction,
         "technique",
         &technique.id,
         &serde_json::to_string(technique).map_err(|error| error.to_string())?,
         device_id,
+        allow_restore,
     )
 }
 
@@ -658,6 +773,23 @@ fn upsert_attachment(
     transaction: &Transaction<'_>,
     attachment: &Attachment,
     device_id: &str,
+) -> Result<(), String> {
+    upsert_attachment_with_mode(transaction, attachment, device_id, false)
+}
+
+fn restore_history_attachment(
+    transaction: &Transaction<'_>,
+    attachment: &Attachment,
+    device_id: &str,
+) -> Result<(), String> {
+    upsert_attachment_with_mode(transaction, attachment, device_id, true)
+}
+
+fn upsert_attachment_with_mode(
+    transaction: &Transaction<'_>,
+    attachment: &Attachment,
+    device_id: &str,
+    allow_restore: bool,
 ) -> Result<(), String> {
     transaction
         .execute(
@@ -689,12 +821,13 @@ fn upsert_attachment(
             ],
         )
         .map_err(|error| error.to_string())?;
-    record_upsert(
+    record_upsert_with_mode(
         transaction,
         "attachment",
         &attachment.id,
         &attachment_sync_payload(attachment)?,
         device_id,
+        allow_restore,
     )
 }
 
@@ -780,6 +913,17 @@ fn delete_position(
     }
     record_delete(transaction, "position_layout", position_id, device_id)?;
     record_delete(transaction, "position", position_id, device_id)
+}
+
+fn delete_attachment(
+    transaction: &Transaction<'_>,
+    attachment_id: &str,
+    device_id: &str,
+) -> Result<(), String> {
+    transaction
+        .execute("DELETE FROM attachments WHERE id = ?1", [attachment_id])
+        .map_err(|error| error.to_string())?;
+    record_delete(transaction, "attachment", attachment_id, device_id)
 }
 
 fn load_positions(transaction: &Transaction<'_>) -> Result<Vec<Position>, String> {
@@ -871,6 +1015,126 @@ fn load_attachments(transaction: &Transaction<'_>) -> Result<Vec<Attachment>, St
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     Ok(attachments)
+}
+
+fn validate_history_snapshot(graph: &KnowledgeGraph) -> Result<(), String> {
+    let position_ids = graph
+        .positions
+        .iter()
+        .map(|position| position.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if position_ids.len() != graph.positions.len() {
+        return Err("History snapshot contains duplicate positions".into());
+    }
+    let technique_ids = graph
+        .techniques
+        .iter()
+        .map(|technique| technique.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if technique_ids.len() != graph.techniques.len() {
+        return Err("History snapshot contains duplicate transitions".into());
+    }
+    let attachment_ids = graph
+        .attachments
+        .iter()
+        .map(|attachment| attachment.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if attachment_ids.len() != graph.attachments.len() {
+        return Err("History snapshot contains duplicate attachments".into());
+    }
+    for technique in &graph.techniques {
+        if !position_ids.contains(technique.source_position_id.as_str())
+            || technique
+                .target_position_id
+                .as_deref()
+                .is_some_and(|target| !position_ids.contains(target))
+        {
+            return Err("History snapshot transition references a missing position".into());
+        }
+    }
+    for attachment in &graph.attachments {
+        let owner_exists = match attachment.owner_type.as_str() {
+            "position" => position_ids.contains(attachment.owner_id.as_str()),
+            "technique" => technique_ids.contains(attachment.owner_id.as_str()),
+            _ => return Err("History snapshot attachment owner type is invalid".into()),
+        };
+        if !owner_exists {
+            return Err("History snapshot attachment references a missing owner".into());
+        }
+    }
+    Ok(())
+}
+
+fn restore_history_snapshot(
+    transaction: &Transaction<'_>,
+    graph: &KnowledgeGraph,
+    device_id: &str,
+) -> Result<(), String> {
+    validate_history_snapshot(graph)?;
+    let current_positions = load_positions(transaction)?
+        .into_iter()
+        .map(|position| (position.id.clone(), position))
+        .collect::<BTreeMap<_, _>>();
+    let current_techniques = load_techniques(transaction)?
+        .into_iter()
+        .map(|technique| (technique.id.clone(), technique))
+        .collect::<BTreeMap<_, _>>();
+    let current_attachments = load_attachments(transaction)?
+        .into_iter()
+        .map(|attachment| (attachment.id.clone(), attachment))
+        .collect::<BTreeMap<_, _>>();
+    let target_positions = graph
+        .positions
+        .iter()
+        .map(|position| (position.id.as_str(), position))
+        .collect::<BTreeMap<_, _>>();
+    let target_techniques = graph
+        .techniques
+        .iter()
+        .map(|technique| (technique.id.as_str(), technique))
+        .collect::<BTreeMap<_, _>>();
+    let target_attachments = graph
+        .attachments
+        .iter()
+        .map(|attachment| (attachment.id.as_str(), attachment))
+        .collect::<BTreeMap<_, _>>();
+
+    for attachment_id in current_attachments.keys() {
+        if !target_attachments.contains_key(attachment_id.as_str()) {
+            delete_attachment(transaction, attachment_id, device_id)?;
+        }
+    }
+    for technique_id in current_techniques.keys() {
+        if !target_techniques.contains_key(technique_id.as_str()) {
+            delete_technique(transaction, technique_id, device_id)?;
+        }
+    }
+    for position_id in current_positions.keys() {
+        if !target_positions.contains_key(position_id.as_str()) {
+            delete_position(transaction, position_id, device_id)?;
+        }
+    }
+    for position in &graph.positions {
+        if current_positions.get(&position.id) != Some(position) {
+            restore_history_position(
+                transaction,
+                current_positions.get(&position.id),
+                position,
+                device_id,
+            )?;
+        }
+    }
+    for technique in &graph.techniques {
+        if current_techniques.get(&technique.id) != Some(technique) {
+            restore_history_technique(transaction, technique, device_id)?;
+        }
+    }
+    for attachment in &graph.attachments {
+        if current_attachments.get(&attachment.id) != Some(attachment) {
+            restore_history_attachment(transaction, attachment, device_id)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn bootstrap_database(
@@ -996,10 +1260,10 @@ pub fn apply_graph_mutation(
             upsert_attachment(&transaction, &attachment, device_id)?;
         }
         GraphMutation::DeleteAttachment { attachment_id } => {
-            transaction
-                .execute("DELETE FROM attachments WHERE id = ?1", [&attachment_id])
-                .map_err(|error| error.to_string())?;
-            record_delete(&transaction, "attachment", &attachment_id, device_id)?;
+            delete_attachment(&transaction, &attachment_id, device_id)?;
+        }
+        GraphMutation::RestoreHistorySnapshot { graph } => {
+            restore_history_snapshot(&transaction, &graph, device_id)?;
         }
     }
     transaction.commit().map_err(|error| error.to_string())
@@ -1051,7 +1315,8 @@ pub fn read_sync_changes(
         let mut statement = transaction
             .prepare(
                 "SELECT sequence, change_id, entity_type, entity_id, operation,
-                        hlc_physical_ms, hlc_logical_counter, origin_device_id, payload_json
+                    generation, hlc_physical_ms, hlc_logical_counter,
+                    origin_device_id, payload_json
                  FROM sync_journal
                  WHERE sequence > ?1
                  ORDER BY sequence
@@ -1068,8 +1333,9 @@ pub fn read_sync_changes(
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })
             .map_err(|error| error.to_string())?
@@ -1086,6 +1352,7 @@ pub fn read_sync_changes(
                 entity_type,
                 entity_id,
                 operation,
+                generation,
                 physical_ms,
                 logical_counter,
                 origin_device_id,
@@ -1097,6 +1364,7 @@ pub fn read_sync_changes(
                     entity_type: SyncEntityType::from_database(&entity_type)?,
                     entity_id,
                     operation: SyncOperation::from_database(&operation)?,
+                    generation,
                     hlc: HybridTimestamp {
                         physical_ms,
                         logical_counter,
@@ -1150,7 +1418,8 @@ pub fn read_sync_snapshot(app_data_dir: &Path, database_url: &str) -> Result<Syn
         let mut statement = transaction
             .prepare(
                 "SELECT winning_change_id, entity_type, entity_id, is_deleted,
-                        hlc_physical_ms, hlc_logical_counter, origin_device_id, payload_json
+                    generation, hlc_physical_ms, hlc_logical_counter,
+                    origin_device_id, payload_json
                  FROM sync_entity_versions
                  ORDER BY CASE
                     WHEN is_deleted = 0 AND entity_type = 'position' THEN 0
@@ -1174,8 +1443,9 @@ pub fn read_sync_snapshot(app_data_dir: &Path, database_url: &str) -> Result<Syn
                     row.get::<_, bool>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(|error| error.to_string())?
@@ -1191,6 +1461,7 @@ pub fn read_sync_snapshot(app_data_dir: &Path, database_url: &str) -> Result<Syn
                 entity_type,
                 entity_id,
                 is_deleted,
+                generation,
                 physical_ms,
                 logical_counter,
                 origin_device_id,
@@ -1211,6 +1482,7 @@ pub fn read_sync_snapshot(app_data_dir: &Path, database_url: &str) -> Result<Syn
                     entity_type: SyncEntityType::from_database(&entity_type)?,
                     entity_id,
                     operation,
+                    generation,
                     hlc: HybridTimestamp {
                         physical_ms,
                         logical_counter,
@@ -1459,6 +1731,9 @@ fn validate_sync_change(change: &SyncChange) -> Result<Option<String>, String> {
     if change.hlc.physical_ms < 0 || change.hlc.logical_counter < 0 {
         return Err("Sync HLC values cannot be negative".into());
     }
+    if change.generation < 0 {
+        return Err("Sync generation cannot be negative".into());
+    }
     match change.operation {
         SyncOperation::Delete => {
             if change.payload.is_some() {
@@ -1551,7 +1826,8 @@ fn incoming_change_wins(
 ) -> Result<bool, String> {
     let current = transaction
         .query_row(
-            "SELECT hlc_physical_ms, hlc_logical_counter, origin_device_id, is_deleted
+            "SELECT generation, hlc_physical_ms, hlc_logical_counter,
+                    origin_device_id, is_deleted
              FROM sync_entity_versions
              WHERE entity_type = ?1 AND entity_id = ?2",
             params![change.entity_type.as_str(), change.entity_id],
@@ -1559,21 +1835,24 @@ fn incoming_change_wins(
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, bool>(3)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| error.to_string())?;
     Ok(current.is_none_or(
-        |(physical_ms, logical_counter, origin_device_id, is_deleted)| {
+        |(generation, physical_ms, logical_counter, origin_device_id, is_deleted)| {
             (
+                change.generation,
                 change.operation == SyncOperation::Delete,
                 change.hlc.physical_ms,
                 change.hlc.logical_counter,
                 change.origin_device_id.as_str(),
             ) > (
+                generation,
                 is_deleted,
                 physical_ms,
                 logical_counter,
@@ -1585,6 +1864,7 @@ fn incoming_change_wins(
 
 #[derive(Clone)]
 struct StoredVersion {
+    generation: i64,
     hlc: HybridTimestamp,
     origin_device_id: String,
     is_deleted: bool,
@@ -1597,18 +1877,20 @@ fn stored_version(
 ) -> Result<Option<StoredVersion>, String> {
     transaction
         .query_row(
-            "SELECT hlc_physical_ms, hlc_logical_counter, origin_device_id, is_deleted
+            "SELECT generation, hlc_physical_ms, hlc_logical_counter,
+                    origin_device_id, is_deleted
              FROM sync_entity_versions
              WHERE entity_type = ?1 AND entity_id = ?2",
             params![entity_type.as_str(), entity_id],
             |row| {
                 Ok(StoredVersion {
+                    generation: row.get(0)?,
                     hlc: HybridTimestamp {
-                        physical_ms: row.get(0)?,
-                        logical_counter: row.get(1)?,
+                        physical_ms: row.get(1)?,
+                        logical_counter: row.get(2)?,
                     },
-                    origin_device_id: row.get(2)?,
-                    is_deleted: row.get(3)?,
+                    origin_device_id: row.get(3)?,
+                    is_deleted: row.get(4)?,
                 })
             },
         )
@@ -1651,7 +1933,9 @@ fn blocking_tombstone(
         change.entity_type,
         &change.entity_id,
         "deleted_entity",
-    )? {
+    )?
+    .filter(|blocker| blocker.version.generation >= change.generation)
+    {
         return Ok(Some(blocker));
     }
     let payload = change
@@ -1702,16 +1986,19 @@ fn record_conflict(
     transaction
         .execute(
             "INSERT INTO sync_conflicts (
-                change_id, entity_type, entity_id, operation, hlc_physical_ms,
-                hlc_logical_counter, origin_device_id, payload_json, reason,
+                     change_id, entity_type, entity_id, operation, generation,
+                     hlc_physical_ms, hlc_logical_counter, origin_device_id,
+                     payload_json, reason,
                 blocking_entity_type, blocking_entity_id, winning_hlc_physical_ms,
-                winning_hlc_logical_counter, winning_origin_device_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     winning_hlc_logical_counter, winning_origin_device_id,
+                     winning_generation
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 change.change_id,
                 change.entity_type.as_str(),
                 change.entity_id,
                 change.operation.as_str(),
+                change.generation,
                 change.hlc.physical_ms,
                 change.hlc.logical_counter,
                 change.origin_device_id,
@@ -1722,6 +2009,7 @@ fn record_conflict(
                 blocker.version.hlc.physical_ms,
                 blocker.version.hlc.logical_counter,
                 blocker.version.origin_device_id,
+                blocker.version.generation,
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -1736,14 +2024,15 @@ fn append_remote_change(
     transaction
         .execute(
             "INSERT INTO sync_journal (
-                change_id, entity_type, entity_id, operation, hlc_physical_ms,
-                hlc_logical_counter, origin_device_id, payload_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     change_id, entity_type, entity_id, operation, generation,
+                     hlc_physical_ms, hlc_logical_counter, origin_device_id, payload_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 change.change_id,
                 change.entity_type.as_str(),
                 change.entity_id,
                 change.operation.as_str(),
+                change.generation,
                 change.hlc.physical_ms,
                 change.hlc.logical_counter,
                 change.origin_device_id,
@@ -1952,10 +2241,12 @@ fn store_remote_winner(
     transaction
         .execute(
             "INSERT INTO sync_entity_versions (
-                entity_type, entity_id, hlc_physical_ms, hlc_logical_counter,
-                     origin_device_id, is_deleted, payload_json, winning_change_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                entity_type, entity_id, generation, hlc_physical_ms,
+                hlc_logical_counter, origin_device_id, is_deleted, payload_json,
+                winning_change_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                generation = excluded.generation,
                 hlc_physical_ms = excluded.hlc_physical_ms,
                 hlc_logical_counter = excluded.hlc_logical_counter,
                 origin_device_id = excluded.origin_device_id,
@@ -1965,6 +2256,7 @@ fn store_remote_winner(
             params![
                 change.entity_type.as_str(),
                 change.entity_id,
+                change.generation,
                 change.hlc.physical_ms,
                 change.hlc.logical_counter,
                 change.origin_device_id,
@@ -1978,10 +2270,11 @@ fn store_remote_winner(
         transaction
             .execute(
                 "INSERT INTO sync_tombstones (
-                    entity_type, entity_id, hlc_physical_ms, hlc_logical_counter,
-                    origin_device_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                          entity_type, entity_id, generation, hlc_physical_ms,
+                          hlc_logical_counter, origin_device_id
+                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                          generation = excluded.generation,
                     hlc_physical_ms = excluded.hlc_physical_ms,
                     hlc_logical_counter = excluded.hlc_logical_counter,
                     origin_device_id = excluded.origin_device_id,
@@ -1989,6 +2282,7 @@ fn store_remote_winner(
                 params![
                     change.entity_type.as_str(),
                     change.entity_id,
+                    change.generation,
                     change.hlc.physical_ms,
                     change.hlc.logical_counter,
                     change.origin_device_id,
@@ -2418,6 +2712,162 @@ mod tests {
     }
 
     #[test]
+    fn restores_and_redeletes_a_cascaded_graph_snapshot() {
+        let directory = TestDirectory::new("history-snapshot");
+        prepare(&directory);
+        let original = KnowledgeGraph {
+            positions: vec![position("p1"), position("p2")],
+            techniques: vec![technique("t1", "p1", Some("p2"))],
+            attachments: vec![
+                attachment("a1", "position", "p1"),
+                attachment("a2", "technique", "t1"),
+            ],
+        };
+        apply_graph_mutation(
+            &directory.0,
+            DATABASE_URL,
+            DEVICE_ID,
+            GraphMutation::ImportGraph {
+                graph: original.clone(),
+            },
+        )
+        .expect("import graph");
+        apply_graph_mutation(
+            &directory.0,
+            DATABASE_URL,
+            DEVICE_ID,
+            GraphMutation::DeletePosition {
+                position_id: "p1".into(),
+            },
+        )
+        .expect("delete position");
+
+        apply_graph_mutation(
+            &directory.0,
+            DATABASE_URL,
+            DEVICE_ID,
+            GraphMutation::RestoreHistorySnapshot {
+                graph: original.clone(),
+            },
+        )
+        .expect("undo delete");
+
+        let connection = directory.connection();
+        let restored: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM positions),
+                    (SELECT COUNT(*) FROM techniques),
+                    (SELECT COUNT(*) FROM attachments)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("count restored graph records");
+        assert_eq!(restored, (2, 1, 2));
+        let restored_generations: Vec<i64> = connection
+            .prepare(
+                "SELECT generation FROM sync_entity_versions
+                 WHERE entity_id IN ('p1', 't1', 'a1', 'a2')
+                 ORDER BY entity_type, entity_id",
+            )
+            .expect("prepare restored generation query")
+            .query_map([], |row| row.get(0))
+            .expect("query restored generations")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect restored generations");
+        assert_eq!(restored_generations, vec![1, 1, 1, 1, 1]);
+        drop(connection);
+
+        apply_graph_mutation(
+            &directory.0,
+            DATABASE_URL,
+            DEVICE_ID,
+            GraphMutation::RestoreHistorySnapshot {
+                graph: KnowledgeGraph {
+                    positions: vec![position("p2")],
+                    techniques: Vec::new(),
+                    attachments: Vec::new(),
+                },
+            },
+        )
+        .expect("redo delete");
+
+        let connection = directory.connection();
+        let redeleted: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM positions),
+                    (SELECT COUNT(*) FROM techniques),
+                    (SELECT COUNT(*) FROM attachments)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("count graph records after redo");
+        assert_eq!(redeleted, (1, 0, 0));
+    }
+
+    #[test]
+    fn history_restore_records_only_changed_position_components() {
+        let directory = TestDirectory::new("history-position-diff");
+        prepare(&directory);
+        let original = position("p1");
+        apply_graph_mutation(
+            &directory.0,
+            DATABASE_URL,
+            DEVICE_ID,
+            GraphMutation::SavePosition {
+                position: original.clone(),
+            },
+        )
+        .expect("save original position");
+
+        let mut moved = original;
+        moved.x = 42.0;
+        apply_graph_mutation(
+            &directory.0,
+            DATABASE_URL,
+            DEVICE_ID,
+            GraphMutation::RestoreHistorySnapshot {
+                graph: KnowledgeGraph {
+                    positions: vec![moved.clone()],
+                    techniques: Vec::new(),
+                    attachments: Vec::new(),
+                },
+            },
+        )
+        .expect("restore moved position");
+
+        let mut renamed = moved;
+        renamed.name = "Renamed position".into();
+        apply_graph_mutation(
+            &directory.0,
+            DATABASE_URL,
+            DEVICE_ID,
+            GraphMutation::RestoreHistorySnapshot {
+                graph: KnowledgeGraph {
+                    positions: vec![renamed],
+                    techniques: Vec::new(),
+                    attachments: Vec::new(),
+                },
+            },
+        )
+        .expect("restore renamed position");
+
+        let entity_types = directory
+            .connection()
+            .prepare("SELECT entity_type FROM sync_journal ORDER BY sequence")
+            .expect("prepare entity type query")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query entity types")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect entity types");
+        assert_eq!(
+            entity_types,
+            vec!["position", "position_layout", "position_layout", "position"]
+        );
+    }
+
+    #[test]
     fn rolls_back_the_entity_and_journal_together() {
         let directory = TestDirectory::new("rollback");
         prepare(&directory);
@@ -2787,6 +3237,7 @@ mod tests {
                     entity_type: SyncEntityType::Position,
                     entity_id: "p1".into(),
                     operation: SyncOperation::Upsert,
+                    generation: 0,
                     hlc: HybridTimestamp {
                         physical_ms: 1,
                         logical_counter: 0,
@@ -2805,6 +3256,7 @@ mod tests {
                     entity_type: SyncEntityType::Technique,
                     entity_id: "t1".into(),
                     operation: SyncOperation::Upsert,
+                    generation: 0,
                     hlc: HybridTimestamp {
                         physical_ms: 2,
                         logical_counter: 0,
@@ -3134,6 +3586,7 @@ mod tests {
             entity_type: SyncEntityType::Position,
             entity_id: "p1".into(),
             operation: SyncOperation::Upsert,
+            generation: 0,
             hlc: HybridTimestamp {
                 physical_ms: 200,
                 logical_counter: 0,
@@ -3152,6 +3605,7 @@ mod tests {
             entity_type: SyncEntityType::Position,
             entity_id: "p1".into(),
             operation: SyncOperation::Delete,
+            generation: 0,
             hlc: HybridTimestamp {
                 physical_ms: 100,
                 logical_counter: 0,
@@ -3200,6 +3654,81 @@ mod tests {
     }
 
     #[test]
+    fn restored_generation_beats_older_delete_regardless_of_arrival_order() {
+        let delete_first = TestDirectory::new("generation-delete-first");
+        let restore_first = TestDirectory::new("generation-restore-first");
+        prepare(&delete_first);
+        prepare(&restore_first);
+
+        let restored_position = position("p1");
+        let restore = SyncChange {
+            sequence: 2,
+            change_id: "cd5a7e7f-e20e-4c85-b251-51b8aac9cf1a".into(),
+            entity_type: SyncEntityType::Position,
+            entity_id: "p1".into(),
+            operation: SyncOperation::Upsert,
+            generation: 1,
+            hlc: HybridTimestamp {
+                physical_ms: 200,
+                logical_counter: 0,
+            },
+            origin_device_id: DEVICE_ID.into(),
+            payload: Some(
+                serde_json::from_str(
+                    &position_entity_payload(&restored_position).expect("position payload"),
+                )
+                .expect("parse position payload"),
+            ),
+        };
+        let delete = SyncChange {
+            sequence: 1,
+            change_id: "f6619bda-bcf1-4765-a1bf-3db31042cbfa".into(),
+            entity_type: SyncEntityType::Position,
+            entity_id: "p1".into(),
+            operation: SyncOperation::Delete,
+            generation: 0,
+            hlc: HybridTimestamp {
+                physical_ms: 300,
+                logical_counter: 0,
+            },
+            origin_device_id: SECOND_DEVICE_ID.into(),
+            payload: None,
+        };
+
+        merge_sync_changes(&delete_first.0, DATABASE_URL, vec![delete.clone()])
+            .expect("apply older delete first");
+        merge_sync_changes(&delete_first.0, DATABASE_URL, vec![restore.clone()])
+            .expect("apply restored generation after delete");
+        merge_sync_changes(&restore_first.0, DATABASE_URL, vec![restore])
+            .expect("apply restored generation first");
+        merge_sync_changes(&restore_first.0, DATABASE_URL, vec![delete])
+            .expect("ignore older delete after restore");
+
+        for directory in [&delete_first, &restore_first] {
+            let connection = directory.connection();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM positions WHERE id = 'p1'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("count restored position"),
+                1
+            );
+            let winner: (i64, bool) = connection
+                .query_row(
+                    "SELECT generation, is_deleted FROM sync_entity_versions
+                     WHERE entity_type = 'position' AND entity_id = 'p1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read restored winner");
+            assert_eq!(winner, (1, false));
+        }
+    }
+
+    #[test]
     fn rolls_back_an_invalid_remote_batch() {
         let directory = TestDirectory::new("invalid-remote");
         prepare(&directory);
@@ -3209,6 +3738,7 @@ mod tests {
             entity_type: SyncEntityType::Technique,
             entity_id: "t1".into(),
             operation: SyncOperation::Upsert,
+            generation: 0,
             hlc: HybridTimestamp {
                 physical_ms: current_time_ms().expect("current time"),
                 logical_counter: 0,
@@ -3280,6 +3810,7 @@ mod tests {
             entity_type: SyncEntityType::Technique,
             entity_id: "t1".into(),
             operation: SyncOperation::Upsert,
+            generation: 0,
             hlc: HybridTimestamp {
                 physical_ms: current_time_ms().expect("current time"),
                 logical_counter: 0,
@@ -3329,6 +3860,7 @@ mod tests {
             entity_type: SyncEntityType::Position,
             entity_id: "p1".into(),
             operation: SyncOperation::Upsert,
+            generation: 0,
             hlc: HybridTimestamp {
                 physical_ms: 1,
                 logical_counter: 0,
@@ -3396,6 +3928,7 @@ mod tests {
             entity_type: SyncEntityType::Position,
             entity_id: "p1".into(),
             operation: SyncOperation::Upsert,
+            generation: 0,
             hlc: HybridTimestamp {
                 physical_ms: tombstone_hlc.0 + 1,
                 logical_counter: 0,
@@ -3419,6 +3952,7 @@ mod tests {
             entity_type: SyncEntityType::Technique,
             entity_id: "t1".into(),
             operation: SyncOperation::Upsert,
+            generation: 1,
             hlc: HybridTimestamp {
                 physical_ms: tombstone_hlc.0 + 2,
                 logical_counter: 0,

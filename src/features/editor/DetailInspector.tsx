@@ -13,6 +13,7 @@ interface DetailInspectorProps {
   techniques: Technique[];
   attachments: Attachment[];
   isBusy: boolean;
+  isActive: boolean;
   focusSelection: boolean;
   onToggleFocus: () => void;
   onEdit: () => void;
@@ -45,6 +46,7 @@ export function DetailInspector({
   techniques,
   attachments,
   isBusy,
+  isActive,
   focusSelection,
   onToggleFocus,
   onEdit,
@@ -165,6 +167,7 @@ export function DetailInspector({
             ownerId={selectedPosition.id}
             attachments={entityAttachments}
             isBusy={isBusy}
+            isActive={isActive}
             onSave={onSaveAttachment}
             onAddMedia={(kind) => onAddMedia("position", selectedPosition.id, kind)}
             onDelete={onDeleteAttachment}
@@ -254,6 +257,7 @@ export function DetailInspector({
             ownerId={selectedTechnique.id}
             attachments={entityAttachments}
             isBusy={isBusy}
+            isActive={isActive}
             onSave={onSaveAttachment}
             onAddMedia={(kind) =>
               onAddMedia("technique", selectedTechnique.id, kind)

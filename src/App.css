@@ -374,6 +374,35 @@ button:disabled {
   background: #fffefa;
 }
 
+.history-controls {
+  height: 34px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: #fffefa;
+}
+
+.history-controls button {
+  width: 32px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-left: 1px solid var(--line);
+  color: var(--ink-muted);
+  background: transparent;
+}
+
+.history-controls button:first-child {
+  border-left: 0;
+}
+
+.history-controls button:hover:not(:disabled) {
+  color: var(--teal);
+  background: var(--teal-soft);
+}
+
 .inspector-mode-control button {
   width: 30px;
   display: grid;
@@ -716,6 +745,42 @@ button:disabled {
   box-shadow: 0 8px 24px rgba(42, 52, 49, 0.14);
   font-size: 10px;
   font-weight: 700;
+}
+
+.video-drop-overlay {
+  position: fixed;
+  z-index: 70;
+  inset: 76px 18px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  pointer-events: none;
+  border: 2px dashed var(--teal);
+  border-radius: 8px;
+  color: var(--teal);
+  background: rgba(247, 245, 239, 0.9);
+  box-shadow: inset 0 0 0 4px rgba(46, 105, 107, 0.08);
+  backdrop-filter: blur(2px);
+}
+
+.video-drop-overlay > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.video-drop-overlay strong {
+  font-size: 15px;
+}
+
+.video-drop-overlay span {
+  max-width: min(420px, 60vw);
+  overflow: hidden;
+  color: var(--ink-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .persistence-status--error {
@@ -2685,7 +2750,7 @@ button:disabled {
   }
 
   .app-toolbar {
-    grid-template-columns: 160px 150px minmax(220px, 1fr) auto;
+    grid-template-columns: 120px 130px minmax(150px, 1fr) auto;
     gap: 10px;
   }
 
@@ -2696,10 +2761,26 @@ button:disabled {
     font-size: 0;
   }
 
+  .toolbar-actions .primary-button {
+    width: 34px;
+    gap: 0;
+    padding: 0;
+    overflow: hidden;
+    font-size: 0;
+  }
+
   .sync-status-button {
     min-width: 34px;
     width: 34px;
     padding: 0;
+  }
+
+  .history-controls {
+    height: 36px;
+  }
+
+  .history-controls button {
+    width: 34px;
   }
 
   .sync-status-button span {
@@ -2739,7 +2820,7 @@ button:disabled {
   }
 
   .app-toolbar {
-    grid-template-columns: 120px minmax(130px, 170px) minmax(180px, 1fr) auto;
+    grid-template-columns: 108px minmax(120px, 150px) minmax(140px, 1fr) auto;
     gap: 10px;
   }
 }

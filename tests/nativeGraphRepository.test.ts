@@ -60,6 +60,12 @@ const attachment: Attachment = {
   value: "Control posture",
 };
 
+const graph = {
+  positions: [position],
+  techniques: [technique],
+  attachments: [attachment],
+};
+
 describe("native graph repository", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -79,6 +85,7 @@ describe("native graph repository", () => {
     await repository.deleteAttachment(attachment.id);
     await repository.deleteTechnique(technique.id);
     await repository.deletePosition(position.id);
+    await repository.restoreHistorySnapshot(graph);
 
     expect(native.invoke.mock.calls).toEqual([
       ["apply_graph_mutation", {
@@ -120,6 +127,10 @@ describe("native graph repository", () => {
         databaseUrl: library.databaseUrl,
         mutation: { type: "deletePosition", positionId: position.id },
       }],
+      ["apply_graph_mutation", {
+        databaseUrl: library.databaseUrl,
+        mutation: { type: "restoreHistorySnapshot", graph },
+      }],
     ]);
     expect(native.load).not.toHaveBeenCalled();
   });
@@ -131,12 +142,6 @@ describe("native graph repository", () => {
       syncLibraryId: "6e6403ae-ff87-47ad-8f75-cfd7866fc04a",
       databaseUrl: "sqlite:native-import-test.db",
     });
-    const graph = {
-      positions: [position],
-      techniques: [technique],
-      attachments: [attachment],
-    };
-
     await expect(repository.importGraph(graph)).resolves.toEqual({
       positions: [],
       techniques: [],

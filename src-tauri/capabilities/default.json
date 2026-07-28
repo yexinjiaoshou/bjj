@@ -9,6 +9,7 @@
     "sql:default",
     "sql:allow-execute",
     "dialog:allow-open",
+    "clipboard-manager:allow-read-text",
     "fs:allow-copy-file",
     "fs:allow-mkdir",
     "fs:allow-remove",

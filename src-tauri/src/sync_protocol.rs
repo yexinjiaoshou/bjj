@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const PROTOCOL_MAJOR: u32 = 2;
+pub const PROTOCOL_MAJOR: u32 = 3;
 pub const MAX_BATCH_CHANGES: u32 = 500;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

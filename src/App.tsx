@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   Database,
+  Film,
   Focus,
   LayoutGrid,
   ListFilter,
@@ -11,10 +12,12 @@ import {
   PanelRightClose,
   PanelRightOpen,
   Plus,
+  Redo2,
   Search,
+  Undo2,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { XYPosition } from "@xyflow/react";
 import "./App.css";
 import {
@@ -44,10 +47,14 @@ import { DetailInspector } from "./features/editor/DetailInspector";
 import {
   PositionEditorDialog,
   TechniqueEditorDialog,
+  type TechniqueSaveRequest,
 } from "./features/editor/EntityEditorDialog";
 import { VideoImportDialog } from "./features/editor/VideoImportDialog";
 import { GraphCanvas } from "./features/graph/GraphCanvas";
-import { createAutomaticLayout } from "./features/graph/layout";
+import {
+  createAutomaticLayout,
+  placeNewTargetPosition,
+} from "./features/graph/layout";
 import { LibrarySwitcher } from "./features/library/LibrarySwitcher";
 import {
   filterGraph,
@@ -69,6 +76,7 @@ import {
   openAttachment,
   pickMediaAttachment,
   prepareVideoImport,
+  prepareVideoImportFromPath,
   type VideoImportDraft,
   type VideoImportOptions,
 } from "./services/media";
@@ -80,6 +88,11 @@ import {
   subscribeSyncActivity,
   type SyncActivity,
 } from "./services/syncActivity";
+import {
+  isSupportedVideoDropPath,
+  subscribeToMacOSVideoDrops,
+  type VideoDragDropEvent,
+} from "./services/videoDrop";
 
 type EditorState =
   | { type: "position"; entity: Position; isNew: boolean }
@@ -89,6 +102,18 @@ type EditorState =
 type InspectorMode = "hidden" | "partial" | "full";
 type MobileView = "browse" | "map" | "details";
 type AndroidBackResult = "handled" | "exit";
+
+interface GraphHistoryEntry {
+  before: KnowledgeGraph;
+  after: KnowledgeGraph;
+}
+
+interface LibraryGraphHistory {
+  undo: GraphHistoryEntry[];
+  redo: GraphHistoryEntry[];
+}
+
+const HISTORY_LIMIT = 100;
 
 declare global {
   interface Window {
@@ -128,6 +153,22 @@ function formatFilterLabel(value: string) {
   return value.replace(/-/g, " ");
 }
 
+function cloneGraphSnapshot(graph: KnowledgeGraph) {
+  return structuredClone(graph);
+}
+
+function graphSnapshotsEqual(left: KnowledgeGraph, right: KnowledgeGraph) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function historyCurrentGraph(history: LibraryGraphHistory) {
+  const nextRedo = history.redo[history.redo.length - 1];
+  if (nextRedo) {
+    return nextRedo.before;
+  }
+  return history.undo[history.undo.length - 1]?.after;
+}
+
 function createPosition(index: number): Position {
   return {
     id: crypto.randomUUID(),
@@ -165,6 +206,10 @@ function App() {
   }));
   const [isCatalogLoading, setIsCatalogLoading] = useState(true);
   const [graph, setGraph] = useState<KnowledgeGraph>(emptyGraph);
+  const graphRef = useRef<KnowledgeGraph>(emptyGraph);
+  const [historyByLibrary, setHistoryByLibrary] = useState<
+    Record<string, LibraryGraphHistory>
+  >({});
   const [selection, setSelection] = useState<GraphSelection>(null);
   const [editor, setEditor] = useState<EditorState>(null);
   const [query, setQuery] = useState("");
@@ -187,6 +232,7 @@ function App() {
     null,
   );
   const [videoProcessingId, setVideoProcessingId] = useState<string | null>(null);
+  const [isVideoDropActive, setIsVideoDropActive] = useState(false);
   const [isSyncDialogOpen, setIsSyncDialogOpen] = useState(false);
   const [syncActivity, setSyncActivity] = useState<SyncActivity>(
     () => getSyncActivity() ?? emptySyncActivity,
@@ -202,6 +248,39 @@ function App() {
     () => getGraphRepository(activeLibrary),
     [activeLibrary],
   );
+  const activeHistory = historyByLibrary[activeLibrary.id];
+  const historyBlocked =
+    isCatalogLoading ||
+    isLoading ||
+    isArranging ||
+    pendingActions > 0 ||
+    videoImportDraft !== null ||
+    layoutPreview !== null ||
+    editor !== null ||
+    isSyncDialogOpen;
+  const canUndo = !historyBlocked && (activeHistory?.undo.length ?? 0) > 0;
+  const canRedo = !historyBlocked && (activeHistory?.redo.length ?? 0) > 0;
+  const selectedDropPosition =
+    selection?.type === "position"
+      ? graph.positions.find((position) => position.id === selection.id)
+      : undefined;
+  const selectedDropTechnique =
+    selection?.type === "technique"
+      ? graph.techniques.find((technique) => technique.id === selection.id)
+      : undefined;
+  const videoDropOwner = selectedDropPosition
+    ? {
+        ownerType: "position" as const,
+        ownerId: selectedDropPosition.id,
+        label: selectedDropPosition.name || "Untitled position",
+      }
+    : selectedDropTechnique
+      ? {
+          ownerType: "technique" as const,
+          ownerId: selectedDropTechnique.id,
+          label: selectedDropTechnique.name || "Untitled transition",
+        }
+      : undefined;
   const syncPresentation = getSyncPresentation(syncActivity, syncOverview);
 
   useEffect(() => subscribeSyncActivity(setSyncActivity), []);
@@ -238,13 +317,14 @@ function App() {
     }
     let cancelled = false;
     setIsLoading(true);
-    setGraph(emptyGraph);
+    replaceGraph(emptyGraph);
 
     async function loadGraph() {
       try {
         const storedGraph = await graphRepository.loadGraph();
         if (!cancelled) {
-          setGraph(storedGraph);
+          validateLibraryHistory(activeLibrary.id, storedGraph);
+          replaceGraph(storedGraph);
         }
       } catch (error) {
         if (!cancelled) {
@@ -337,6 +417,84 @@ function App() {
     clearFilters();
   }
 
+  function replaceGraph(nextGraph: KnowledgeGraph) {
+    graphRef.current = nextGraph;
+    setGraph(nextGraph);
+  }
+
+  function recordGraphHistory(
+    libraryId: string,
+    before: KnowledgeGraph,
+    after: KnowledgeGraph,
+  ) {
+    if (graphSnapshotsEqual(before, after)) {
+      return;
+    }
+    const entry = {
+      before: cloneGraphSnapshot(before),
+      after: cloneGraphSnapshot(after),
+    };
+    setHistoryByLibrary((current) => {
+      const history = current[libraryId] ?? { undo: [], redo: [] };
+      return {
+        ...current,
+        [libraryId]: {
+          undo: [...history.undo, entry].slice(-HISTORY_LIMIT),
+          redo: [],
+        },
+      };
+    });
+  }
+
+  function commitGraphChange(
+    before: KnowledgeGraph,
+    after: KnowledgeGraph,
+    libraryId = activeLibrary.id,
+  ) {
+    replaceGraph(after);
+    recordGraphHistory(libraryId, before, after);
+  }
+
+  function clearLibraryHistory(libraryId: string) {
+    setHistoryByLibrary((current) => {
+      if (!current[libraryId]) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[libraryId];
+      return next;
+    });
+  }
+
+  function validateLibraryHistory(
+    libraryId: string,
+    loadedGraph: KnowledgeGraph,
+  ) {
+    setHistoryByLibrary((current) => {
+      const history = current[libraryId];
+      const expectedGraph = history && historyCurrentGraph(history);
+      if (!expectedGraph || graphSnapshotsEqual(expectedGraph, loadedGraph)) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[libraryId];
+      return next;
+    });
+  }
+
+  function reconcileSelection(nextGraph: KnowledgeGraph) {
+    setSelection((current) => {
+      if (!current) {
+        return null;
+      }
+      const stillExists =
+        current.type === "position"
+          ? nextGraph.positions.some((position) => position.id === current.id)
+          : nextGraph.techniques.some((technique) => technique.id === current.id);
+      return stillExists ? current : null;
+    });
+  }
+
   async function changeLibrary(libraryId: string) {
     if (
       libraryId === libraryCatalog.activeLibraryId ||
@@ -350,6 +508,7 @@ function App() {
     beginAction();
     try {
       await saveLibraryCatalog(nextCatalog);
+      clearLibraryHistory(libraryId);
       resetLibraryWorkspace();
       setLibraryCatalog(nextCatalog);
     } catch (error) {
@@ -464,18 +623,12 @@ function App() {
     ]);
     setLibraryCatalog(catalog);
     setLayoutPreview(null);
-    setGraph(syncedGraph);
+    if (!graphSnapshotsEqual(graphRef.current, syncedGraph)) {
+      clearLibraryHistory(syncedLibrary.id);
+    }
+    replaceGraph(syncedGraph);
     setSyncOverview(overview);
-    setSelection((current) => {
-      if (!current) {
-        return null;
-      }
-      const stillExists =
-        current.type === "position"
-          ? syncedGraph.positions.some((position) => position.id === current.id)
-          : syncedGraph.techniques.some((technique) => technique.id === current.id);
-      return stillExists ? current : null;
-    });
+    reconcileSelection(syncedGraph);
   }
 
   function beginAction() {
@@ -487,44 +640,130 @@ function App() {
     setPendingActions((current) => Math.max(0, current - 1));
   }
 
-  async function movePosition(positionId: string, coordinates: XYPosition) {
-    if (layoutPreview) {
+  async function restoreHistory(direction: "undo" | "redo") {
+    if (historyBlocked) {
       return;
     }
+    const libraryId = activeLibrary.id;
+    const history = historyByLibrary[libraryId];
+    const source = direction === "undo" ? history?.undo : history?.redo;
+    const entry = source?.[source.length - 1];
+    if (!entry) {
+      return;
+    }
+    const target = cloneGraphSnapshot(
+      direction === "undo" ? entry.before : entry.after,
+    );
+    beginAction();
+    try {
+      await graphRepository.restoreHistorySnapshot(target);
+      replaceGraph(target);
+      reconcileSelection(target);
+      setEditor(null);
+      setLayoutPreview(null);
+      setEmptyStateDismissed(target.positions.length > 0);
+      setHistoryByLibrary((current) => {
+        const currentHistory = current[libraryId];
+        if (!currentHistory) {
+          return current;
+        }
+        return {
+          ...current,
+          [libraryId]:
+            direction === "undo"
+              ? {
+                  undo: currentHistory.undo.slice(0, -1),
+                  redo: [...currentHistory.redo, entry],
+                }
+              : {
+                  undo: [...currentHistory.undo, entry].slice(-HISTORY_LIMIT),
+                  redo: currentHistory.redo.slice(0, -1),
+                },
+        };
+      });
+    } catch (error) {
+      setErrorMessage(
+        getErrorMessage(
+          direction === "undo" ? "Could not undo the change" : "Could not redo the change",
+          error,
+        ),
+      );
+    } finally {
+      finishAction();
+    }
+  }
+
+  useEffect(() => {
+    const handleHistoryShortcut = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable ||
+          target.matches("input, textarea, select"))
+      ) {
+        return;
+      }
+      if (!(event.metaKey || event.ctrlKey) || event.altKey) {
+        return;
+      }
+      const key = event.key.toLowerCase();
+      if (key === "z" && event.shiftKey && canRedo) {
+        event.preventDefault();
+        void restoreHistory("redo");
+      } else if (key === "z" && !event.shiftKey && canUndo) {
+        event.preventDefault();
+        void restoreHistory("undo");
+      } else if (key === "y" && !event.shiftKey && canRedo) {
+        event.preventDefault();
+        void restoreHistory("redo");
+      }
+    };
+    window.addEventListener("keydown", handleHistoryShortcut);
+    return () => window.removeEventListener("keydown", handleHistoryShortcut);
+  }, [canRedo, canUndo, historyByLibrary, historyBlocked]);
+
+  async function movePosition(positionId: string, coordinates: XYPosition) {
+    if (layoutPreview || pendingActions > 0) {
+      return;
+    }
+    const before = cloneGraphSnapshot(graphRef.current);
     beginAction();
     try {
       await graphRepository.movePosition(positionId, coordinates);
-      setGraph((current) => ({
+      const current = graphRef.current;
+      commitGraphChange(before, {
         ...current,
         positions: current.positions.map((position) =>
           position.id === positionId
             ? { ...position, x: coordinates.x, y: coordinates.y }
             : position,
         ),
-      }));
+      });
     } catch (error) {
       setErrorMessage(getErrorMessage("Could not save the position layout", error));
-      setGraph((current) => ({
-        ...current,
-        positions: current.positions.map((position) => ({ ...position })),
-      }));
+      replaceGraph({
+        ...graphRef.current,
+        positions: graphRef.current.positions.map((position) => ({ ...position })),
+      });
     } finally {
       finishAction();
     }
   }
 
   async function savePosition(position: Position) {
+    const before = cloneGraphSnapshot(graphRef.current);
     beginAction();
     try {
       await graphRepository.savePosition(position);
-      setGraph((current) => ({
+      const current = graphRef.current;
+      commitGraphChange(before, {
         ...current,
         positions: current.positions.some((item) => item.id === position.id)
           ? current.positions.map((item) =>
               item.id === position.id ? position : item,
             )
           : [...current.positions, position],
-      }));
+      });
       setSelection({ type: "position", id: position.id });
       if (isMobileLayout) {
         setMobileView("details");
@@ -538,25 +777,99 @@ function App() {
     }
   }
 
-  async function saveTechnique(technique: Technique) {
+  async function saveTechnique({
+    technique,
+    targetMode,
+  }: TechniqueSaveRequest) {
+    const before = cloneGraphSnapshot(graphRef.current);
     beginAction();
     try {
+      if (targetMode === "create") {
+        const current = graphRef.current;
+        const targetDraft = {
+          ...createPosition(current.positions.length),
+          name: technique.name,
+        };
+        const linkedTechnique = {
+          ...technique,
+          targetPositionId: targetDraft.id,
+        };
+        const targetPosition = await placeNewTargetPosition(
+          current.positions,
+          current.techniques,
+          targetDraft,
+          linkedTechnique,
+        );
+
+        await graphRepository.savePosition(targetPosition);
+        try {
+          await graphRepository.saveTechnique(linkedTechnique);
+        } catch (error) {
+          const latest = graphRef.current;
+          commitGraphChange(before, {
+            ...latest,
+            positions: [...latest.positions, targetPosition],
+          });
+          setSelection({ type: "position", id: targetPosition.id });
+          if (isMobileLayout) {
+            setMobileView("details");
+          }
+          setEditor(null);
+          setEmptyStateDismissed(true);
+          setErrorMessage(
+            getErrorMessage(
+              "Position created, but transition could not be saved",
+              error,
+            ),
+          );
+          return;
+        }
+
+        const latest = graphRef.current;
+        commitGraphChange(before, {
+          ...latest,
+          positions: [...latest.positions, targetPosition],
+          techniques: latest.techniques.some(
+            (item) => item.id === linkedTechnique.id,
+          )
+            ? latest.techniques.map((item) =>
+                item.id === linkedTechnique.id ? linkedTechnique : item,
+              )
+            : [...latest.techniques, linkedTechnique],
+        });
+        setSelection({ type: "technique", id: linkedTechnique.id });
+        if (isMobileLayout) {
+          setMobileView("details");
+        }
+        setEditor(null);
+        setEmptyStateDismissed(true);
+        return;
+      }
+
       await graphRepository.saveTechnique(technique);
-      setGraph((current) => ({
+      const current = graphRef.current;
+      commitGraphChange(before, {
         ...current,
         techniques: current.techniques.some((item) => item.id === technique.id)
           ? current.techniques.map((item) =>
               item.id === technique.id ? technique : item,
             )
           : [...current.techniques, technique],
-      }));
+      });
       setSelection({ type: "technique", id: technique.id });
       if (isMobileLayout) {
         setMobileView("details");
       }
       setEditor(null);
     } catch (error) {
-      setErrorMessage(getErrorMessage("Could not save the transition", error));
+      setErrorMessage(
+        getErrorMessage(
+          targetMode === "create"
+            ? "Could not create the target position"
+            : "Could not save the transition",
+          error,
+        ),
+      );
     } finally {
       finishAction();
     }
@@ -587,25 +900,18 @@ function App() {
       if (!technique || !window.confirm(`Delete “${technique.name}”?`)) {
         return;
       }
-      const removedAttachments = graph.attachments.filter(
-        (attachment) => attachment.ownerId === technique.id,
-      );
+      const before = cloneGraphSnapshot(graphRef.current);
       beginAction();
       try {
         await graphRepository.deleteTechnique(technique.id);
-        setGraph((current) => ({
+        const current = graphRef.current;
+        commitGraphChange(before, {
           ...current,
           techniques: current.techniques.filter((item) => item.id !== technique.id),
           attachments: current.attachments.filter(
             (attachment) => attachment.ownerId !== technique.id,
           ),
-        }));
-        const cleanup = await Promise.allSettled(
-          removedAttachments.map(deleteImportedMedia),
-        );
-        if (cleanup.some((result) => result.status === "rejected")) {
-          setErrorMessage("The transition was deleted, but a media file could not be removed.");
-        }
+        });
       } catch (error) {
         setErrorMessage(getErrorMessage("Could not delete the transition", error));
         return;
@@ -632,13 +938,12 @@ function App() {
         return;
       }
       const removedIds = new Set([position.id, ...affectedTechniqueIds]);
-      const removedAttachments = graph.attachments.filter((attachment) =>
-        removedIds.has(attachment.ownerId),
-      );
+      const before = cloneGraphSnapshot(graphRef.current);
       beginAction();
       try {
         await graphRepository.deletePosition(position.id);
-        setGraph((current) => ({
+        const current = graphRef.current;
+        commitGraphChange(before, {
           positions: current.positions.filter((item) => item.id !== position.id),
           techniques: current.techniques.filter(
             (technique) => !affectedTechniqueIds.includes(technique.id),
@@ -646,13 +951,7 @@ function App() {
           attachments: current.attachments.filter(
             (attachment) => !removedIds.has(attachment.ownerId),
           ),
-        }));
-        const cleanup = await Promise.allSettled(
-          removedAttachments.map(deleteImportedMedia),
-        );
-        if (cleanup.some((result) => result.status === "rejected")) {
-          setErrorMessage("The position was deleted, but a media file could not be removed.");
-        }
+        });
       } catch (error) {
         setErrorMessage(getErrorMessage("Could not delete the position", error));
         return;
@@ -685,10 +984,11 @@ function App() {
   }
 
   async function importStarterMap() {
+    const before = cloneGraphSnapshot(graphRef.current);
     beginAction();
     try {
       const importedGraph = await graphRepository.importGraph(sampleGraph);
-      setGraph(importedGraph);
+      commitGraphChange(before, importedGraph);
       setEmptyStateDismissed(true);
     } catch (error) {
       setErrorMessage(getErrorMessage("Could not import the starter map", error));
@@ -698,17 +998,19 @@ function App() {
   }
 
   async function saveAttachment(attachment: Attachment) {
+    const before = cloneGraphSnapshot(graphRef.current);
     beginAction();
     try {
       await graphRepository.saveAttachment(attachment);
-      setGraph((current) => ({
+      const current = graphRef.current;
+      commitGraphChange(before, {
         ...current,
         attachments: current.attachments.some((item) => item.id === attachment.id)
           ? current.attachments.map((item) =>
               item.id === attachment.id ? attachment : item,
             )
           : [...current.attachments, attachment],
-      }));
+      });
     } catch (error) {
       setErrorMessage(getErrorMessage("Could not save the source", error));
     } finally {
@@ -722,25 +1024,11 @@ function App() {
     kind: Extract<Attachment["kind"], "image" | "video">,
   ) {
     if (kind === "video") {
-      beginAction();
-      try {
-        const draft = await prepareVideoImport(
-          ownerType,
-          ownerId,
-          activeLibrary.mediaDirectory,
-          activeLibrary.databaseUrl,
-        );
-        if (draft) {
-          setVideoImportDraft(draft);
-        }
-      } catch (error) {
-        setErrorMessage(getErrorMessage("Could not prepare the video", error));
-      } finally {
-        finishAction();
-      }
+      await prepareVideoAttachment(ownerType, ownerId);
       return;
     }
 
+    const before = cloneGraphSnapshot(graphRef.current);
     let attachment: Attachment | null = null;
     beginAction();
     try {
@@ -755,10 +1043,11 @@ function App() {
         return;
       }
       await graphRepository.saveAttachment(attachment);
-      setGraph((current) => ({
+      const current = graphRef.current;
+      commitGraphChange(before, {
         ...current,
         attachments: [...current.attachments, attachment as Attachment],
-      }));
+      });
     } catch (error) {
       if (attachment) {
         await deleteImportedMedia(attachment).catch(() => undefined);
@@ -769,21 +1058,54 @@ function App() {
     }
   }
 
+  async function prepareVideoAttachment(
+    ownerType: Attachment["ownerType"],
+    ownerId: string,
+    sourcePath?: string,
+  ) {
+    beginAction();
+    try {
+      const draft = sourcePath
+        ? await prepareVideoImportFromPath(
+            ownerType,
+            ownerId,
+            sourcePath,
+            activeLibrary.mediaDirectory,
+            activeLibrary.databaseUrl,
+          )
+        : await prepareVideoImport(
+            ownerType,
+            ownerId,
+            activeLibrary.mediaDirectory,
+            activeLibrary.databaseUrl,
+          );
+      if (draft) {
+        setVideoImportDraft(draft);
+      }
+    } catch (error) {
+      setErrorMessage(getErrorMessage("Could not prepare the video", error));
+    } finally {
+      finishAction();
+    }
+  }
+
   async function confirmVideoImport(options: VideoImportOptions) {
     if (!videoImportDraft) {
       return;
     }
     const draft = videoImportDraft;
+    const before = cloneGraphSnapshot(graphRef.current);
     let attachment: Attachment | null = null;
     setVideoProcessingId(draft.id);
     beginAction();
     try {
       attachment = await finishVideoImport(draft, options);
       await graphRepository.saveAttachment(attachment);
-      setGraph((current) => ({
+      const current = graphRef.current;
+      commitGraphChange(before, {
         ...current,
         attachments: [...current.attachments, attachment as Attachment],
-      }));
+      });
       setVideoImportDraft(null);
     } catch (error) {
       if (isVideoProcessingCancelled(error)) {
@@ -830,22 +1152,17 @@ function App() {
     if (!window.confirm(`Delete “${attachment.title}”?`)) {
       return;
     }
+    const before = cloneGraphSnapshot(graphRef.current);
     beginAction();
     try {
       await graphRepository.deleteAttachment(attachment.id);
-      setGraph((current) => ({
+      const current = graphRef.current;
+      commitGraphChange(before, {
         ...current,
         attachments: current.attachments.filter(
           (item) => item.id !== attachment.id,
         ),
-      }));
-      try {
-        await deleteImportedMedia(attachment);
-      } catch (error) {
-        setErrorMessage(
-          getErrorMessage("The source was removed, but its media file remains", error),
-        );
-      }
+      });
     } catch (error) {
       setErrorMessage(getErrorMessage("Could not delete the source", error));
     } finally {
@@ -857,7 +1174,11 @@ function App() {
     beginAction();
     try {
       await downloadMediaAttachment(activeLibrary.syncLibraryId, attachment);
-      setGraph(await graphRepository.loadGraph());
+      const downloadedGraph = await graphRepository.loadGraph();
+      if (!graphSnapshotsEqual(graphRef.current, downloadedGraph)) {
+        clearLibraryHistory(activeLibrary.id);
+      }
+      replaceGraph(downloadedGraph);
     } catch (error) {
       setErrorMessage(getErrorMessage("Could not download the media", error));
     } finally {
@@ -889,10 +1210,11 @@ function App() {
     if (!layoutPreview) {
       return;
     }
+    const before = cloneGraphSnapshot(graphRef.current);
     beginAction();
     try {
       await graphRepository.saveLayout(layoutPreview);
-      setGraph((current) => ({ ...current, positions: layoutPreview }));
+      commitGraphChange(before, { ...graphRef.current, positions: layoutPreview });
       setLayoutPreview(null);
     } catch (error) {
       setErrorMessage(getErrorMessage("Could not save the layout", error));
@@ -931,6 +1253,84 @@ function App() {
     }
     setMobileView(nextView);
   }
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+
+    const handleVideoDrop = (event: VideoDragDropEvent) => {
+      if (event.type === "leave") {
+        setIsVideoDropActive(false);
+        return;
+      }
+      if (event.type === "enter") {
+        setIsVideoDropActive(
+          !historyBlocked &&
+            Boolean(videoDropOwner) &&
+            event.paths.length === 1 &&
+            isSupportedVideoDropPath(event.paths[0]),
+        );
+        return;
+      }
+      if (event.type !== "drop") {
+        return;
+      }
+
+      setIsVideoDropActive(false);
+      if (historyBlocked) {
+        return;
+      }
+      if (!videoDropOwner) {
+        setErrorMessage(
+          "Could not import the dropped video: select a position or transition first",
+        );
+        return;
+      }
+      if (event.paths.length !== 1) {
+        setErrorMessage(
+          "Could not import the dropped video: drop one video file at a time",
+        );
+        return;
+      }
+      const [sourcePath] = event.paths;
+      if (!isSupportedVideoDropPath(sourcePath)) {
+        setErrorMessage(
+          "Could not import the dropped video: use an MP4, MOV, or M4V file",
+        );
+        return;
+      }
+      void prepareVideoAttachment(
+        videoDropOwner.ownerType,
+        videoDropOwner.ownerId,
+        sourcePath,
+      );
+    };
+
+    void subscribeToMacOSVideoDrops(handleVideoDrop)
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten?.();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch((error) => {
+        if (!disposed) {
+          setErrorMessage(getErrorMessage("Could not enable video drag and drop", error));
+        }
+      });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [
+    activeLibrary.databaseUrl,
+    activeLibrary.mediaDirectory,
+    historyBlocked,
+    videoDropOwner?.ownerId,
+    videoDropOwner?.ownerType,
+  ]);
 
   useEffect(() => {
     const handleAndroidBack = (): AndroidBackResult => {
@@ -1056,6 +1456,26 @@ function App() {
             <Network size={16} />
             <span>{syncPresentation.label}</span>
           </button>
+          <div className="history-controls" role="group" aria-label="Edit history">
+            <button
+              type="button"
+              onClick={() => void restoreHistory("undo")}
+              disabled={!canUndo}
+              title="Undo"
+              aria-label="Undo last change"
+            >
+              <Undo2 size={16} />
+            </button>
+            <button
+              type="button"
+              onClick={() => void restoreHistory("redo")}
+              disabled={!canRedo}
+              title="Redo"
+              aria-label="Redo last change"
+            >
+              <Redo2 size={16} />
+            </button>
+          </div>
           <button
             type="button"
             className="secondary-button"
@@ -1249,7 +1669,7 @@ function App() {
             selection={selection}
             focusSelection={focusSelection}
             revealRequest={revealRequest}
-            readOnly={isArranging || layoutPreview !== null}
+            readOnly={isArranging || pendingActions > 0 || layoutPreview !== null}
             onSelect={selectEntity}
             onMovePosition={movePosition}
             onConnectPositions={(sourcePositionId, targetPositionId) =>
@@ -1268,6 +1688,7 @@ function App() {
             techniques={graph.techniques}
             attachments={graph.attachments}
             isBusy={isArranging || pendingActions > 0 || layoutPreview !== null}
+            isActive={!isMobileLayout || mobileView === "details"}
             focusSelection={focusSelection}
             onToggleFocus={() => setFocusSelection((current) => !current)}
             onEdit={editSelection}
@@ -1316,6 +1737,16 @@ function App() {
           <span>Details</span>
         </button>
       </nav>
+
+      {isVideoDropActive && videoDropOwner && (
+        <div className="video-drop-overlay" role="status" aria-live="polite">
+          <Film size={28} />
+          <div>
+            <strong>Release to import video</strong>
+            <span>{videoDropOwner.label}</span>
+          </div>
+        </div>
+      )}
 
       {(errorMessage || pendingActions > 0) && (
         <div

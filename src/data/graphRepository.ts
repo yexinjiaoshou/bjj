@@ -29,6 +29,7 @@ export interface GraphRepository {
   deleteTechnique(techniqueId: string): Promise<void>;
   saveAttachment(attachment: Attachment): Promise<void>;
   deleteAttachment(attachmentId: string): Promise<void>;
+  restoreHistorySnapshot(graph: KnowledgeGraph): Promise<void>;
 }
 
 interface PositionRow {
@@ -79,7 +80,8 @@ type NativeGraphMutation =
   | { type: "saveTechnique"; technique: Technique }
   | { type: "deleteTechnique"; techniqueId: string }
   | { type: "saveAttachment"; attachment: Attachment }
-  | { type: "deleteAttachment"; attachmentId: string };
+  | { type: "deleteAttachment"; attachmentId: string }
+  | { type: "restoreHistorySnapshot"; graph: KnowledgeGraph };
 
 function parseStringArray(value: string): string[] {
   try {
@@ -237,6 +239,10 @@ class SqliteGraphRepository implements GraphRepository {
   async deleteAttachment(attachmentId: string): Promise<void> {
     await this.applyMutation({ type: "deleteAttachment", attachmentId });
   }
+
+  async restoreHistorySnapshot(graph: KnowledgeGraph): Promise<void> {
+    await this.applyMutation({ type: "restoreHistorySnapshot", graph });
+  }
 }
 
 class BrowserGraphRepository implements GraphRepository {
@@ -357,6 +363,10 @@ class BrowserGraphRepository implements GraphRepository {
       (attachment) => attachment.id !== attachmentId,
     );
     this.writeGraph(graph);
+  }
+
+  async restoreHistorySnapshot(graph: KnowledgeGraph) {
+    this.writeGraph(cloneGraph(graph));
   }
 }
 

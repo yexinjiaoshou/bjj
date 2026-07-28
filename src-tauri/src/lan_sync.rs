@@ -2018,6 +2018,7 @@ mod tests {
             entity_type: crate::sync_store::SyncEntityType::Position,
             entity_id: "p1".into(),
             operation: crate::sync_store::SyncOperation::Upsert,
+            generation: 0,
             hlc: crate::sync_store::HybridTimestamp {
                 physical_ms: i64::MAX / 4,
                 logical_counter: 0,
@@ -2059,6 +2060,7 @@ mod tests {
             entity_type: crate::sync_store::SyncEntityType::Position,
             entity_id: "p1".into(),
             operation: crate::sync_store::SyncOperation::Upsert,
+            generation: 0,
             hlc: crate::sync_store::HybridTimestamp {
                 physical_ms: i64::MAX / 3,
                 logical_counter: 0,

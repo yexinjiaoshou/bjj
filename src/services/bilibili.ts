@@ -8,6 +8,7 @@ const BILIBILI_HOSTS = new Set([
   "www.bilibili.com",
 ]);
 const BVID_PATTERN = /^BV[0-9A-Za-z]{10}$/i;
+const BILIBILI_INSPECTION_TIMEOUT_MS = 15_000;
 
 export interface BilibiliPage {
   page: number;
@@ -143,7 +144,25 @@ export function describeBilibiliLink(value: string) {
 }
 
 export async function inspectBilibiliLink(value: string) {
-  return invoke<BilibiliVideoInfo>("inspect_bilibili_link", {
-    url: extractHttpUrl(value),
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(
+        new Error("Bilibili took too long to respond. You can still save the link."),
+      );
+    }, BILIBILI_INSPECTION_TIMEOUT_MS);
   });
+
+  try {
+    return await Promise.race([
+      invoke<BilibiliVideoInfo>("inspect_bilibili_link", {
+        url: extractHttpUrl(value),
+      }),
+      timeout,
+    ]);
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  }
 }

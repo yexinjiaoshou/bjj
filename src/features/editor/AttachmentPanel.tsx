@@ -36,6 +36,10 @@ import {
   normalizeHttpUrl,
   resolveMediaUrl,
 } from "../../services/media";
+import {
+  parseClipboardLink,
+  readClipboardText,
+} from "../../services/clipboard";
 
 declare global {
   interface Window {
@@ -45,6 +49,31 @@ declare global {
 
 type EditableAttachmentKind = Extract<Attachment["kind"], "note" | "link">;
 type MediaAttachmentKind = Extract<Attachment["kind"], "image" | "video">;
+
+interface VideoPlayback {
+  currentTime: number;
+  playing: boolean;
+}
+
+function readVideoPlayback(video: HTMLVideoElement): VideoPlayback {
+  return {
+    currentTime: Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime) : 0,
+    playing: !video.paused,
+  };
+}
+
+function seekVideo(video: HTMLVideoElement, currentTime: number) {
+  if (!Number.isFinite(currentTime) || currentTime < 0) {
+    return;
+  }
+  try {
+    video.currentTime = currentTime;
+  } catch {}
+}
+
+function resumeVideo(video: HTMLVideoElement) {
+  void video.play().catch(() => {});
+}
 
 interface BilibiliPreviewTarget {
   page: number;
@@ -57,6 +86,7 @@ interface AttachmentPanelProps {
   ownerId: string;
   attachments: Attachment[];
   isBusy: boolean;
+  isActive?: boolean;
   onSave: (attachment: Attachment) => void;
   onAddMedia: (kind: MediaAttachmentKind) => void;
   onDelete: (attachment: Attachment) => void;
@@ -102,6 +132,7 @@ function AttachmentDialog({
     null,
   );
   const titleWasEdited = useRef(false);
+  const valueWasEdited = useRef(false);
   const inspectionVersion = useRef(0);
 
   useEffect(
@@ -152,6 +183,45 @@ function AttachmentDialog({
     }
   }
 
+  function fillLinkFromText(sourceText: string) {
+    const clipboardLink = parseClipboardLink(sourceText);
+    if (!clipboardLink) {
+      return false;
+    }
+    setValue(clipboardLink.url);
+    setBilibiliInfo(null);
+    setBilibiliError(null);
+    if (clipboardLink.title && !titleWasEdited.current) {
+      setTitle(clipboardLink.title);
+    }
+    if (isBilibiliUrl(clipboardLink.url)) {
+      void recognizeBilibili(clipboardLink.url);
+    }
+    return true;
+  }
+
+  useEffect(() => {
+    if (kind !== "link") {
+      return;
+    }
+    let cancelled = false;
+    void readClipboardText()
+      .then((clipboardText) => {
+        if (
+          cancelled ||
+          valueWasEdited.current ||
+          typeof clipboardText !== "string"
+        ) {
+          return;
+        }
+        fillLinkFromText(clipboardText);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [kind]);
+
   function currentBilibiliUrl() {
     if (!bilibiliInfo) {
       return null;
@@ -194,17 +264,12 @@ function AttachmentDialog({
 
   function handleLinkPaste(event: ClipboardEvent<HTMLInputElement>) {
     const pastedValue = event.clipboardData.getData("text");
-    const extractedValue = extractHttpUrl(pastedValue);
-    if (!/^https?:\/\//i.test(extractedValue)) {
+    if (!parseClipboardLink(pastedValue)) {
       return;
     }
     event.preventDefault();
-    setValue(extractedValue);
-    setBilibiliInfo(null);
-    setBilibiliError(null);
-    if (isBilibiliUrl(extractedValue)) {
-      void recognizeBilibili(extractedValue);
-    }
+    valueWasEdited.current = true;
+    fillLinkFromText(pastedValue);
   }
 
   function testBilibiliLink() {
@@ -317,6 +382,7 @@ function AttachmentDialog({
                   }}
                   onChange={(event) => {
                     inspectionVersion.current += 1;
+                    valueWasEdited.current = true;
                     setIsInspecting(false);
                     setValue(event.target.value);
                     setBilibiliInfo(null);
@@ -546,7 +612,7 @@ function AttachmentDialog({
             <button
               type="submit"
               className="primary-button"
-              disabled={isBusy || isInspecting}
+              disabled={isBusy}
             >
               {isBusy ? "Saving..." : "Add source"}
             </button>
@@ -562,28 +628,41 @@ function MediaViewer({
   kind,
   title,
   previewUrl,
+  initialPlayback,
+  isActive,
   onClose,
 }: {
   kind: MediaAttachmentKind;
   title: string;
   previewUrl: string;
-  onClose: () => void;
+  initialPlayback?: VideoPlayback;
+  isActive: boolean;
+  onClose: (playback?: VideoPlayback) => void;
 }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const closeViewer = () => {
+    const video = videoRef.current;
+    const playback = video ? readVideoPlayback(video) : undefined;
+    video?.pause();
+    onClose(playback);
+  };
+
   useEffect(() => {
     const previousCloseHandler = window.__ROLLMAP_CLOSE_ACTIVE_OVERLAY__;
     const closeActiveOverlay = () => {
-      onClose();
+      closeViewer();
       return true;
     };
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        onClose();
+        closeViewer();
       }
     };
 
     window.__ROLLMAP_CLOSE_ACTIVE_OVERLAY__ = closeActiveOverlay;
     window.addEventListener("keydown", handleKeyDown);
     return () => {
+      videoRef.current?.pause();
       window.removeEventListener("keydown", handleKeyDown);
       if (window.__ROLLMAP_CLOSE_ACTIVE_OVERLAY__ === closeActiveOverlay) {
         if (previousCloseHandler) {
@@ -594,6 +673,12 @@ function MediaViewer({
       }
     };
   }, [onClose]);
+
+  useEffect(() => {
+    if (!isActive) {
+      closeViewer();
+    }
+  }, [isActive]);
 
   return createPortal(
     <section
@@ -608,7 +693,7 @@ function MediaViewer({
           type="button"
           title="Close fullscreen preview"
           aria-label="Close fullscreen preview"
-          onClick={onClose}
+          onClick={closeViewer}
           autoFocus
         >
           <X size={21} />
@@ -618,14 +703,29 @@ function MediaViewer({
         className="media-viewer__stage"
         onMouseDown={(event) => {
           if (event.target === event.currentTarget) {
-            onClose();
+            closeViewer();
           }
         }}
       >
         {kind === "image" ? (
           <img src={previewUrl} alt={title} draggable={false} />
         ) : (
-          <video src={previewUrl} controls playsInline autoPlay />
+          <video
+            ref={videoRef}
+            src={previewUrl}
+            controls
+            playsInline
+            preload="metadata"
+            onLoadedMetadata={(event) => {
+              if (!initialPlayback) {
+                return;
+              }
+              seekVideo(event.currentTarget, initialPlayback.currentTime);
+              if (initialPlayback.playing) {
+                resumeVideo(event.currentTarget);
+              }
+            }}
+          />
         )}
       </div>
     </section>,
@@ -639,12 +739,19 @@ function AttachmentItem({
   onDelete,
   onDownload,
   onOpen,
-}: Pick<AttachmentPanelProps, "isBusy" | "onDelete" | "onDownload" | "onOpen"> & {
+  isActive,
+}: Pick<
+  AttachmentPanelProps,
+  "isBusy" | "onDelete" | "onDownload" | "onOpen"
+> & {
   attachment: Attachment;
+  isActive: boolean;
 }) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [fullscreenPlayback, setFullscreenPlayback] = useState<VideoPlayback | null>(null);
+  const inlineVideoRef = useRef<HTMLVideoElement>(null);
   const bilibiliDescription =
     attachment.kind === "link" ? describeBilibiliLink(attachment.value) : null;
   const isMissingMedia = Boolean(
@@ -679,6 +786,15 @@ function AttachmentItem({
     };
   }, [attachment, isMissingMedia]);
 
+  useEffect(() => {
+    if (!isActive) {
+      inlineVideoRef.current?.pause();
+    }
+    return () => {
+      inlineVideoRef.current?.pause();
+    };
+  }, [isActive]);
+
   const previewKind =
     attachment.kind === "image" || attachment.kind === "video"
       ? attachment.kind
@@ -697,6 +813,7 @@ function AttachmentItem({
               />
             ) : (
               <video
+                ref={inlineVideoRef}
                 src={previewUrl}
                 controls
                 playsInline
@@ -709,7 +826,12 @@ function AttachmentItem({
               className="attachment-fullscreen"
               title={`View ${attachment.title} fullscreen`}
               aria-label={`View ${attachment.title} fullscreen`}
-              onClick={() => setIsFullscreen(true)}
+              onClick={() => {
+                const video = inlineVideoRef.current;
+                setFullscreenPlayback(video ? readVideoPlayback(video) : null);
+                video?.pause();
+                setIsFullscreen(true);
+              }}
             >
               <Maximize2 size={16} />
             </button>
@@ -770,7 +892,19 @@ function AttachmentItem({
           kind={previewKind}
           title={attachment.title}
           previewUrl={previewUrl}
-          onClose={() => setIsFullscreen(false)}
+          initialPlayback={fullscreenPlayback ?? undefined}
+          isActive={isActive}
+          onClose={(playback) => {
+            setIsFullscreen(false);
+            const video = inlineVideoRef.current;
+            if (!video || !playback) {
+              return;
+            }
+            seekVideo(video, playback.currentTime);
+            if (playback.playing && isActive) {
+              resumeVideo(video);
+            }
+          }}
         />
       )}
     </>
@@ -782,6 +916,7 @@ export function AttachmentPanel({
   ownerId,
   attachments,
   isBusy,
+  isActive = true,
   onSave,
   onAddMedia,
   onDelete,
@@ -843,6 +978,7 @@ export function AttachmentPanel({
             key={attachment.id}
             attachment={attachment}
             isBusy={isBusy}
+            isActive={isActive}
             onDelete={onDelete}
             onDownload={onDownload}
             onOpen={onOpen}

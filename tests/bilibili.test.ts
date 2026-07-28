@@ -72,4 +72,20 @@ describe("Bilibili links", () => {
       url: "https://b23.tv/AbCd12",
     });
   });
+
+  it("stops waiting when the native inspector does not return", async () => {
+    vi.useFakeTimers();
+    native.invoke.mockReturnValue(new Promise(() => {}));
+    const inspection = inspectBilibiliLink("https://b23.tv/AbCd12").then(
+      () => "resolved",
+      (error) => (error instanceof Error ? error.message : String(error)),
+    );
+
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    await expect(inspection).resolves.toBe(
+      "Bilibili took too long to respond. You can still save the link.",
+    );
+    vi.useRealTimers();
+  });
 });

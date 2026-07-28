@@ -95,11 +95,53 @@ describe("knowledge editor interactions", () => {
     await user.click(screen.getByRole("button", { name: "Add transition" }));
     expect(onSave).toHaveBeenCalledWith(
       expect.objectContaining({
-        name: "Guard entry",
-        sourcePositionId: source.id,
-        targetPositionId: target.id,
+        targetMode: "existing",
+        technique: expect.objectContaining({
+          name: "Guard entry",
+          sourcePositionId: source.id,
+          targetPositionId: target.id,
+        }),
       }),
     );
+  });
+
+  it("creates a target position by default for a new transition", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn();
+    const source = sampleGraph.positions[0];
+    render(
+      <TechniqueEditorDialog
+        technique={{
+          id: "new-target-technique",
+          sourcePositionId: source.id,
+          targetPositionId: null,
+          name: "",
+          description: "",
+          giMode: "both",
+          difficulty: "foundation",
+          tags: [],
+        }}
+        positions={sampleGraph.positions}
+        isNew
+        onSave={onSave}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText("To")).toHaveDisplayValue(
+      "Create new position",
+    );
+    await user.type(screen.getByLabelText("Name"), "Butterfly Sweep");
+    await user.click(screen.getByRole("button", { name: "Add transition" }));
+
+    expect(onSave).toHaveBeenCalledWith({
+      targetMode: "create",
+      technique: expect.objectContaining({
+        sourcePositionId: source.id,
+        targetPositionId: null,
+        name: "Butterfly Sweep",
+      }),
+    });
   });
 
   it("saves a transition with an unknown destination", async () => {
@@ -125,19 +167,48 @@ describe("knowledge editor interactions", () => {
       />,
     );
 
-    expect(screen.getByLabelText("To")).toHaveDisplayValue(
-      "Unknown (set later)",
-    );
+    await user.selectOptions(screen.getByLabelText("To"), "");
+    expect(screen.getByLabelText("To")).toHaveDisplayValue("Unknown (set later)");
     await user.type(screen.getByLabelText("Name"), "Follow the reaction");
     await user.click(screen.getByRole("button", { name: "Add transition" }));
 
     expect(onSave).toHaveBeenCalledWith(
       expect.objectContaining({
-        sourcePositionId: source.id,
-        targetPositionId: null,
-        name: "Follow the reaction",
+        targetMode: "unknown",
+        technique: expect.objectContaining({
+          sourcePositionId: source.id,
+          targetPositionId: null,
+          name: "Follow the reaction",
+        }),
       }),
     );
+  });
+
+  it("keeps an existing unresolved transition set to unknown", () => {
+    const source = sampleGraph.positions[0];
+    render(
+      <TechniqueEditorDialog
+        technique={{
+          id: "existing-unknown-technique",
+          sourcePositionId: source.id,
+          targetPositionId: null,
+          name: "Follow the reaction",
+          description: "",
+          giMode: "both",
+          difficulty: "foundation",
+          tags: [],
+        }}
+        positions={sampleGraph.positions}
+        isNew={false}
+        onSave={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText("To")).toHaveDisplayValue("Unknown (set later)");
+    expect(
+      screen.queryByRole("option", { name: "Create new position" }),
+    ).not.toBeInTheDocument();
   });
 
   it("starts a transition from the selected position", async () => {
